@@ -1,14 +1,14 @@
 FROM python:3.10-slim
 
 # Install system dependencies required for building lxml and other tools
-RUN apt-get update && apt-get install -y \\
-    gcc \\
-    g++ \\
-    libxml2-dev \\
-    libxslt-dev \\
-    libffi-dev \\
-    libssl-dev \\
-    git \\
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libxml2-dev \
+    libxslt-dev \
+    libffi-dev \
+    libssl-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
