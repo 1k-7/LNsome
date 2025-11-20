@@ -14,16 +14,14 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # 1. HIGH SPEED: 60 Threads
-        self.init_executor(60)
-        
-        # 2. CONNECTION POOLING: Allow 60 simultaneous connections
-        # Without this, Python limits you to 10, making extra threads useless.
-        adapter = HTTPAdapter(
-            pool_connections=60, 
-            pool_maxsize=60,
-            max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        )
+        # 1. THREADS: We will let bot.py override this, but set a high default
+        self.init_executor(100)
+        self.cleaner.bad_css.update({'div[align="center"]'})
+
+        # 2. POOLING: Crucial for speed. Allows 100 active connections without blocking.
+        # Retry strategy handles the occasional 429/500 error from speed.
+        retry = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
 
@@ -35,46 +33,40 @@ class FanMTLCrawler(Crawler):
         possible_title = soup.select_one("h1.novel-title")
         self.novel_title = possible_title.text.strip() if possible_title else "Unknown Novel"
 
-        # --- COVER ---
-        # Matches <figure class="cover"><img src="...">
-        img_tag = soup.select_one("figure.cover img")
-        if not img_tag:
-            img_tag = soup.select_one(".fixed-img img")
-        
+        # --- COVER (Matches your HTML) ---
+        # Logic: Try specific figure first, then generic div
+        img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
             url = img_tag.get("src")
-            # FanMTL sometimes puts the real image in data-src
+            # Handle lazy loading placeholders
             if "placeholder" in str(url) and img_tag.get("data-src"):
                 url = img_tag.get("data-src")
             self.novel_cover = self.absolute_url(url)
+        logger.info("Cover: %s", self.novel_cover)
 
         # --- AUTHOR ---
-        # Matches <div class="author">...<span itemprop="author">
         author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
         if author_tag:
-            text = author_tag.text.strip()
-            self.novel_author = text if "http" not in text else "Unknown"
+            self.novel_author = author_tag.text.strip()
         else:
             self.novel_author = "Unknown"
 
-        # --- SUMMARY ---
-        # Matches <div class="summary">...<div class="content">
+        # --- SUMMARY (Matches your HTML) ---
         summary_div = soup.select_one(".summary .content")
         if summary_div:
             self.novel_synopsis = summary_div.get_text("\n\n").strip()
         else:
             self.novel_synopsis = "Summary not available."
 
-        # --- VOLUMES & CHAPTERS ---
+        # --- CHAPTERS ---
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
+        # Pagination Logic
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        
         if not pagination:
             self.parse_chapter_list(soup)
         else:
-            # Get last page number
             last_page = pagination[-1]
             last_page_url = self.absolute_url(last_page["href"])
             common_page_url = last_page_url.split("?")[0]
@@ -91,8 +83,7 @@ class FanMTLCrawler(Crawler):
                 
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
-            except Exception as e:
-                logger.error("Pagination error: %s", e)
+            except Exception:
                 self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"])
@@ -107,22 +98,11 @@ class FanMTLCrawler(Crawler):
                     url=self.absolute_url(a["href"]),
                     title=a.select_one(".chapter-title").text.strip(),
                 ))
-            except Exception:
-                pass
+            except: pass
 
     def download_chapter_body(self, chapter):
         soup = self.get_soup(chapter["url"])
         body = soup.select_one("#chapter-article .chapter-content")
-        
-        if not body:
-            return "<p>Content not found on source site.</p>"
-
-        # --- CRITICAL FIX ---
-        # The method is 'extract_contents', NOT 'extract'.
-        # This was causing the crash and empty files.
-        content = self.cleaner.extract_contents(body)
-        
-        if not content:
-            return "<p>Empty content.</p>"
-            
-        return content
+        if not body: return ""
+        # FIXED: Use extract_contents (prevents 'AttributeError')
+        return self.cleaner.extract_contents(body)
