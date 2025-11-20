@@ -1,3 +1,4 @@
+cat > requirements.txt <<EOL
 python-telegram-bot==20.6
 readability-lxml
 slugify
