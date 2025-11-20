@@ -15,7 +15,6 @@ from telegram.ext import (
     filters,
 )
 
-# Import lncrawl components
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
 
@@ -26,7 +25,6 @@ DOWNLOAD_DIR = "downloads"
 PROCESSED_FILE = "processed.json"
 ERRORS_FILE = "errors.json"
 
-# Logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -74,6 +72,7 @@ class NovelBot:
 
         application = Application.builder().token(TOKEN).build()
         application.add_handler(CommandHandler("start", self.cmd_start))
+        application.add_handler(CommandHandler("reset", self.cmd_reset))
         application.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
         
         print("🚀 Loading sources...")
@@ -84,10 +83,18 @@ class NovelBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            f"⚡ **High Performance Bot** ⚡\n"
-            f"History: {len(self.processed)} processed, {len(self.errors)} errors.\n"
-            "Send a JSON file to start."
+            f"⚡ **FanMTL Bot** ⚡\n"
+            f"Processed: `{len(self.processed)}` | Errors: `{len(self.errors)}`\n"
+            "Send a JSON file to start.\n"
+            "Send /reset to clear history."
         )
+
+    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.processed = set()
+        self.errors = {}
+        if os.path.exists(PROCESSED_FILE): os.remove(PROCESSED_FILE)
+        if os.path.exists(ERRORS_FILE): os.remove(ERRORS_FILE)
+        await update.message.reply_text("🗑️ **History Reset.** You can now re-download previously processed novels.")
 
     async def handle_json_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         document = update.message.document
@@ -105,7 +112,7 @@ class NovelBot:
                 return
 
             to_process = [u for u in urls if u not in self.processed]
-            msg = f"📥 **Batch Received**\nTotal: {len(urls)}\nNew: {len(to_process)}"
+            msg = f"📥 **Batch Received**\nTotal: {len(urls)}\nQueueing: {len(to_process)}"
             await update.message.reply_text(msg)
 
             for url in to_process:
@@ -179,19 +186,25 @@ class NovelBot:
             if app.crawler:
                 app.crawler.init_executor(MAX_WORKERS)
 
-            # --- FIX: DOWNLOAD COVER MANUALLY ---
+            # --- COVER FIX ---
+            # Ensure we have a valid cover image path that exists locally
             if app.crawler.novel_cover:
                 try:
                     progress_queue.put("🖼️ Downloading cover...")
-                    # Use the crawler's session (cloudscraper) to avoid 403 Forbidden
+                    # We use the crawler's internal scraper to bypass blocks
                     response = app.crawler.get_response(app.crawler.novel_cover)
-                    cover_path = os.path.join(app.output_path, 'cover.jpg')
+                    # Save to the EXACT output path with a specific filename
+                    cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
                     with open(cover_path, 'wb') as f:
                         f.write(response.content)
-                    app.book_cover = cover_path # Explicitly tell the binder to use this
+                    
+                    # Set the app property to the absolute local path
+                    app.book_cover = cover_path
+                    logger.info(f"Cover saved to: {cover_path}")
                 except Exception as e:
                     logger.warning(f"Failed to download cover: {e}")
-            # ------------------------------------
+                    app.book_cover = None
+            # ------------------
 
             app.chapters = app.crawler.chapters[:]
             app.pack_by_volume = False
