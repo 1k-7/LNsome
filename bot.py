@@ -1,4 +1,3 @@
-cat > bot.py <<EOL
 import os
 import json
 import logging
