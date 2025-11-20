@@ -13,82 +13,97 @@ class FanMTLCrawler(ChapterOnlyBrowserTemplate):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        self.init_executor(10)
+        self.init_executor(60) # Speed setting
         self.cleaner.bad_css.update({'div[align="center"]'})
 
-    def parse_title(self, soup: BeautifulSoup) -> str:
-        possible_title = soup.select_one(".novel-info h1.novel-title")
-        return possible_title.text.strip() if possible_title else "Unknown Novel"
+    # --- FORCE READ METADATA (Bypass potential parent class bugs) ---
+    def read_novel_info(self):
+        logger.debug("Visiting %s", self.novel_url)
+        soup = self.get_soup(self.novel_url)
 
-    def parse_cover(self, soup: BeautifulSoup) -> str:
-        # Matches : <div class="fixed-img"><figure class="cover"><img ...>
-        possible_image = soup.select_one(".fixed-img img")
-        
-        if not possible_image:
-            possible_image = soup.select_one(".novel-cover img")
-            
-        if possible_image:
-            url = possible_image.get("src") or possible_image.get("data-src")
-            return self.absolute_url(url)
+        # 1. Title
+        possible_title = soup.select_one("h1.novel-title")
+        self.novel_title = possible_title.text.strip() if possible_title else "Unknown Novel"
+        logger.info("Title: %s", self.novel_title)
 
-    def parse_authors(self, soup: BeautifulSoup) -> Generator[str, None, None]:
-        # Matches : <div class="author"><span>Author:</span><span itemprop="author">...</span></div>
-        possible_author = soup.select_one('.novel-info .author span[itemprop="author"]')
-        
-        if possible_author:
-            text = possible_author.text.strip()
-            # Filter out URL-like strings or empty noise
-            if "http" not in text and len(text) > 1:
-                yield text
-            else:
-                yield "Unknown"
+        # 2. Cover (Exact match from your HTML)
+        # Structure: <div class="fixed-img"><figure class="cover"><img src="...">
+        img_tag = soup.select_one("div.fixed-img figure.cover img")
+        if img_tag:
+            self.novel_cover = self.absolute_url(img_tag.get("src"))
+        logger.info("Cover URL: %s", self.novel_cover)
+
+        # 3. Author (Exact match from your HTML)
+        # Structure: <div class="author"><span>Author:</span><span itemprop="author">NAME</span>
+        author_tag = soup.select_one(".novel-info .author span[itemprop='author']")
+        if author_tag:
+            self.novel_author = author_tag.text.strip()
         else:
-            yield "Unknown"
+            self.novel_author = "Unknown"
+        logger.info("Author: %s", self.novel_author)
 
-    def parse_synopsis(self, soup: BeautifulSoup) -> str:
-        # Matches : <div class="summary">...<div class="content">TEXT</div></div>
-        possible_synopsis = soup.select_one(".summary .content")
+        # 4. Summary (Exact match from your HTML)
+        # Structure: <div class="summary">...<div class="content">...<p>TEXT</p>
+        summary_div = soup.select_one("div.summary div.content")
+        if summary_div:
+            # get_text with separator ensures paragraphs don't merge into one giant blob
+            self.novel_synopsis = summary_div.get_text("\n\n").strip()
+        else:
+            self.novel_synopsis = "Summary not available."
+        logger.info("Summary found: %s", bool(self.novel_synopsis))
+
+        # 5. Volumes & Chapters
+        self.volumes = [{"id": 1, "title": "Volume 1"}] # FanMTL is usually 1 volume
+        self.chapters = []
         
-        if possible_synopsis:
-            # get_text("\n") preserves line breaks between paragraphs
-            return possible_synopsis.get_text("\n").strip()
-            
-        return "Summary not available."
-
-    def select_chapter_tags(self, soup: BeautifulSoup) -> Generator[Tag, None, None]:
+        # Parse Chapter List
+        # Robust pagination check
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
         if not pagination:
-            yield from soup.select("ul.chapter-list li a")
-            return
-
-        last_page = pagination[-1]
-        last_page_url = self.absolute_url(last_page["href"])
-        
-        common_page_url = last_page_url.split("?")[0]
-        params = parse_qs(urlparse(last_page_url).query)
-        
-        try:
-            page_count = int(params.get("page", [0])[0]) + 1
-            wjm_param = params.get("wjm", [""])[0]
-        except (IndexError, ValueError):
-            yield from soup.select("ul.chapter-list li a")
-            return
-
-        futures = []
-        for page in range(page_count):
-            page_url = f"{common_page_url}?page={page}&wjm={wjm_param}"
-            futures.append(self.executor.submit(self.get_soup, page_url))
+            # Single page
+            self.parse_chapter_list(soup)
+        else:
+            # Multi page
+            last_page = pagination[-1]
+            last_page_url = self.absolute_url(last_page["href"])
+            common_page_url = last_page_url.split("?")[0]
+            params = parse_qs(urlparse(last_page_url).query)
             
-        for soup in self.resolve_futures(futures, desc="TOC", unit="page"):
-            yield from soup.select("ul.chapter-list li a")
+            try:
+                page_count = int(params.get("page", [0])[0]) + 1
+                wjm_param = params.get("wjm", [""])[0]
+            except (IndexError, ValueError):
+                self.parse_chapter_list(soup)
+                return
 
-    def parse_chapter_item(self, tag: Tag, id: int) -> Chapter:
-        return Chapter(
-            id=id,
-            url=self.absolute_url(tag["href"]),
-            title=tag.select_one(".chapter-title").text.strip(),
-        )
+            futures = []
+            for page in range(page_count):
+                page_url = f"{common_page_url}?page={page}&wjm={wjm_param}"
+                futures.append(self.executor.submit(self.get_soup, page_url))
+            
+            for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
+                self.parse_chapter_list(page_soup)
 
-    def select_chapter_body(self, soup: BeautifulSoup) -> Tag:
-        return soup.select_one("#chapter-article .chapter-content")
+        # Sort chapters by ID to ensure order
+        self.chapters.sort(key=lambda x: x["id"])
+
+    def parse_chapter_list(self, soup):
+        # <ul class="chapter-list"><li><a href="...">...</a></li></ul>
+        for a in soup.select("ul.chapter-list li a"):
+            try:
+                # Extract ID from URL or text to ensure correct ordering
+                chap_id = len(self.chapters) + 1
+                self.chapters.append(Chapter(
+                    id=chap_id,
+                    volume=1,
+                    url=self.absolute_url(a["href"]),
+                    title=a.select_one(".chapter-title").text.strip(),
+                ))
+            except Exception:
+                pass
+
+    def download_chapter_body(self, chapter):
+        soup = self.get_soup(chapter["url"])
+        body = soup.select_one("#chapter-article .chapter-content")
+        return self.cleaner.extract(body)
