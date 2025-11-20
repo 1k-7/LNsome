@@ -1,5 +1,3 @@
-cat > Dockerfile <<EOL
-# Base image
 FROM python:3.10-slim
 
 # Install system dependencies required for building lxml and other tools
