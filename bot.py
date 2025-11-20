@@ -23,32 +23,49 @@ from lncrawl.core.sources import load_sources
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# 100 Threads per novel = ~15-25 chapters/sec on good hardware
-THREADS_PER_NOVEL = 100
+# SPEED: 50 Threads assigned to ONE novel at a time.
+THREADS_PER_NOVEL = 50
 
 DATA_DIR = "data"
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
+ERRORS_FILE = os.path.join(DATA_DIR, "errors.json")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class NovelBot:
     def __init__(self):
+        # Executor pool size matches thread count
         self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="bot_worker")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         self.load_history()
 
     def load_history(self):
         self.processed = set()
+        self.errors = {}
         if os.path.exists(PROCESSED_FILE):
             try:
                 with open(PROCESSED_FILE, 'r') as f: self.processed = set(json.load(f))
             except: pass
+        if os.path.exists(ERRORS_FILE):
+            try:
+                with open(ERRORS_FILE, 'r') as f: self.errors = json.load(f)
+            except: pass
 
     def save_success(self, url):
         self.processed.add(url)
+        if url in self.errors:
+            del self.errors[url]
+            self.save_errors()
         with open(PROCESSED_FILE, 'w') as f: json.dump(list(self.processed), f, indent=2)
+
+    def save_errors(self):
+        with open(ERRORS_FILE, 'w') as f: json.dump(self.errors, f, indent=2)
+
+    def save_error(self, url, error_msg):
+        self.errors[url] = str(error_msg)
+        self.save_errors()
 
     def start(self):
         if not TOKEN: return
@@ -63,11 +80,13 @@ class NovelBot:
         application.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Turbo** ⚡\nProcessed: {len(self.processed)}\nSend JSON to start.")
+        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nHistory: {len(self.processed)}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.processed = set()
+        self.errors = {}
         if os.path.exists(PROCESSED_FILE): os.remove(PROCESSED_FILE)
+        if os.path.exists(ERRORS_FILE): os.remove(ERRORS_FILE)
         await update.message.reply_text("🗑️ History Reset.")
 
     async def handle_json_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78,8 +97,9 @@ class NovelBot:
         try:
             with open(file_path, 'r', encoding='utf-8') as f: urls = json.load(f)
             to_process = [u for u in urls if u not in self.processed]
-            await update.message.reply_text(f"📥 **Batch Started**\nNovels: {len(to_process)}\nMode: Sequential (Max Speed)")
+            await update.message.reply_text(f"📥 **Batch Received**\nQueue: {len(to_process)}\nProcessing: 1 by 1")
             
+            # Process Sequentially
             for url in to_process:
                 await self.process_novel(url, update, context)
             
@@ -101,7 +121,6 @@ class NovelBot:
         while not future.done():
             try:
                 text = progress_queue.get_nowait()
-                # Limit updates to every 3s to avoid flooding Telegram
                 if text != last_text and (time.time() - last_update) > 3:
                     try: await status_msg.edit_text(text); last_text = text; last_update = time.time()
                     except: pass
@@ -112,7 +131,7 @@ class NovelBot:
             duration = int(time.time() - start_time)
             if epub_path and os.path.exists(epub_path):
                 file_size = os.path.getsize(epub_path) / (1024 * 1024)
-                await status_msg.edit_text(f"✅ **Done** ({duration}s) - {file_size:.1f}MB\nUploading...")
+                await status_msg.edit_text(f"✅ **Success** ({duration}s) - {file_size:.1f}MB\nUploading...")
                 await update.message.reply_document(
                     document=open(epub_path, 'rb'),
                     caption=f"📕 {os.path.basename(epub_path)}\n⏱️ {duration}s"
@@ -124,6 +143,7 @@ class NovelBot:
         except Exception as e:
             logger.error(f"Fail: {url} -> {e}")
             await status_msg.edit_text(f"❌ Error: {e}")
+            self.save_error(url, str(e))
 
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
@@ -133,10 +153,9 @@ class NovelBot:
             app.prepare_search()
             app.get_novel_info()
             
-            # Set High Thread Count
             if app.crawler: app.crawler.init_executor(THREADS_PER_NOVEL)
 
-            # Download Cover (With Headers)
+            # Download Cover
             if app.crawler.novel_cover:
                 try:
                     headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
@@ -155,13 +174,20 @@ class NovelBot:
             progress_queue.put(f"⬇️ Downloading {total} chapters...")
             
             for i, _ in enumerate(app.start_download()):
-                if i % 30 == 0: progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
+                if i % 20 == 0: progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
             
-            # Safety: Ensure content exists
-            valid_chapters = [c for c in app.chapters if c.body and len(c.body) > 50]
-            if not valid_chapters: raise Exception("Critical: No content downloaded.")
+            # --- INTEGRITY CHECK ---
+            # 1. Filter out empty bodies
+            valid_chapters = [c for c in app.chapters if c.body and len(c.body.strip()) > 50]
+            
+            # 2. Compare count. If missing even 1 chapter, FAIL the whole book.
+            if len(valid_chapters) < total:
+                missing_count = total - len(valid_chapters)
+                raise Exception(f"Integrity Check Failed: Missing {missing_count} chapters.")
+            
+            app.chapters = valid_chapters
 
-            progress_queue.put(f"📦 Binding {len(valid_chapters)} chapters...")
+            progress_queue.put("📦 Binding...")
             for fmt, f in app.bind_books(): return f
             return None
 
