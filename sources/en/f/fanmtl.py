@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 import logging
-from typing import Generator
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup, Tag
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -13,56 +13,53 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # High concurrency for TOC fetching
-        self.init_executor(60) 
+        # 1. NUCLEAR SPEED: 100 threads for TOC
+        self.init_executor(100)
         self.cleaner.bad_css.update({'div[align="center"]'})
+
+        # 2. CRITICAL: Increase Connection Pool to match threads
+        # Without this, you are capped at 10 speeds regardless of thread count
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
+        self.scraper.mount("https://", adapter)
+        self.scraper.mount("http://", adapter)
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
-        # 1. Title
-        possible_title = soup.select_one(".novel-info h1.novel-title")
+        # Title
+        possible_title = soup.select_one("h1.novel-title")
         self.novel_title = possible_title.text.strip() if possible_title else "Unknown Novel"
 
-        # 2. Cover
-        # Priority: <figure class="cover"> inside header
+        # Cover (Fixed Selector)
         img_tag = soup.select_one("figure.cover img")
         if not img_tag:
-             # Fallback: Try to find the image inside the fixed-img div
              img_tag = soup.select_one(".fixed-img img")
-            
         if img_tag:
-            # Get src or data-src (lazy loading)
-            url = img_tag.get("src") or img_tag.get("data-src")
+            url = img_tag.get("src")
+            if "placeholder" in str(url) and img_tag.get("data-src"):
+                url = img_tag.get("data-src")
             self.novel_cover = self.absolute_url(url)
-        
-        logger.info("Cover URL found: %s", self.novel_cover)
 
-        # 3. Author
+        # Author
         author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
         if author_tag:
             text = author_tag.text.strip()
-            if "http" not in text and len(text) > 1:
-                self.novel_author = text
-            else:
-                self.novel_author = "Unknown"
+            self.novel_author = text if "http" not in text else "Unknown"
         else:
             self.novel_author = "Unknown"
 
-        # 4. Summary
-        # Target the specific content div inside the summary section
+        # Summary
         summary_div = soup.select_one(".summary .content")
         if summary_div:
             self.novel_synopsis = summary_div.get_text("\n\n").strip()
         else:
             self.novel_synopsis = "Summary not available."
 
-        # 5. Volumes
+        # Volumes & Chapters
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # 6. Chapters
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
         if not pagination:
@@ -106,5 +103,5 @@ class FanMTLCrawler(Crawler):
     def download_chapter_body(self, chapter):
         soup = self.get_soup(chapter["url"])
         body = soup.select_one("#chapter-article .chapter-content")
-        # FIX: Use extract_contents instead of extract
+        # Must use extract_contents
         return self.cleaner.extract_contents(body)
