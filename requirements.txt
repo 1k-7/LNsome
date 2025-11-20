@@ -8,3 +8,4 @@ cloudscraper
 lxml
 pillow
 colorama
+python-box
