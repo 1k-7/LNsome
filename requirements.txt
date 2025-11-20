@@ -1,0 +1,10 @@
+python-telegram-bot==20.6
+readability-lxml
+slugify
+python-slugify
+bs4
+requests
+cloudscraper
+lxml
+pillow
+colorama
