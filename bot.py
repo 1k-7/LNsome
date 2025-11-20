@@ -19,12 +19,11 @@ from telegram.ext import (
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
 
-# Disable SSL warnings for cleaner logs at high speed
+# Disable SSL warnings at high concurrency
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# NUCLEAR SPEED: 200 Concurrent connections
 MAX_WORKERS = 200 
 DATA_DIR = "data"
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
@@ -38,8 +37,7 @@ logger = logging.getLogger(__name__)
 
 class NovelBot:
     def __init__(self):
-        # Increased bot worker threads to handle multiple books processing at once
-        self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="bot_worker")
+        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="bot_worker")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         self.load_history()
 
@@ -84,13 +82,11 @@ class NovelBot:
         print("🚀 Loading sources...")
         load_sources()
         print(f"✅ Bot online! (Threads: {MAX_WORKERS})")
-        
         application.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            f"⚡ **FanMTL Bot (Nuclear Mode)** ⚡\n"
-            f"Threads: `{MAX_WORKERS}`\n"
+            f"⚡ **FanMTL Bot** ⚡\n"
             f"Processed: `{len(self.processed)}`\n"
             "Send a JSON file to start."
         )
@@ -100,7 +96,7 @@ class NovelBot:
         self.errors = {}
         if os.path.exists(PROCESSED_FILE): os.remove(PROCESSED_FILE)
         if os.path.exists(ERRORS_FILE): os.remove(ERRORS_FILE)
-        await update.message.reply_text("🗑️ History Reset.")
+        await update.message.reply_text("🗑️ History Reset. Re-send your JSON file.")
 
     async def handle_json_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         document = update.message.document
@@ -122,6 +118,7 @@ class NovelBot:
 
         except Exception as e:
             logger.error(f"File Error: {e}")
+            await update.message.reply_text("❌ File error.")
         finally:
             if os.path.exists(file_path): os.remove(file_path)
 
@@ -140,7 +137,6 @@ class NovelBot:
             try:
                 text = progress_queue.get_nowait()
                 now = time.time()
-                # Lowered update interval to 2s to feel more responsive
                 if text != last_text and (now - last_update) > 2:
                     try:
                         await status_msg.edit_text(text)
@@ -156,7 +152,7 @@ class NovelBot:
             
             if epub_path and os.path.exists(epub_path):
                 file_size = os.path.getsize(epub_path) / (1024 * 1024)
-                await status_msg.edit_text(f"✅ **Done** ({duration}s)\nSize: {file_size:.1f}MB. Uploading...")
+                await status_msg.edit_text(f"✅ **Success** ({duration}s)\nUploading {file_size:.1f}MB...")
                 
                 await update.message.reply_document(
                     document=open(epub_path, 'rb'),
@@ -166,7 +162,7 @@ class NovelBot:
                 self.save_success(url)
                 os.remove(epub_path)
             else:
-                raise Exception("File generation failed.")
+                raise Exception("File not generated.")
                 
         except Exception as e:
             logger.error(f"Fail: {url} -> {e}", exc_info=True)
@@ -176,22 +172,26 @@ class NovelBot:
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
         try:
-            progress_queue.put(f"🔍 Getting TOC...")
+            progress_queue.put(f"🔍 Fetching info...")
             app.user_input = url
             app.prepare_search()
             app.get_novel_info()
             
             if app.crawler:
-                # Override with NUCLEAR thread count
                 app.crawler.init_executor(MAX_WORKERS)
 
+            # --- COVER DOWNLOAD ---
             if app.crawler.novel_cover:
                 try:
+                    progress_queue.put("🖼️ Downloading cover...")
+                    # Headers are critical for images protected by Cloudflare/Hotlink rules
                     headers = {
                         "Referer": "https://www.fanmtl.com/",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                     }
+                    # Use the internal scraper to perform the GET request
                     response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=10)
+                    
                     if response.status_code == 200:
                         cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
                         with open(cover_path, 'wb') as f:
@@ -207,12 +207,9 @@ class NovelBot:
             total = len(app.chapters)
             progress_queue.put(f"⬇️ Downloading {total} chapters...")
 
-            # Iterate download generator
             for i, _ in enumerate(app.start_download()):
-                if i % 50 == 0 or i == total:
+                if i % 40 == 0 or i == total:
                     percent = int(app.progress)
-                    # Explicitly mention thread count in logs to verify it worked
-                    logger.info(f"Progress: {percent}% ({i}/{total})")
                     progress_queue.put(f"🚀 Downloading: {percent}% ({i}/{total})")
             
             if not [c for c in app.chapters if c.body]:
