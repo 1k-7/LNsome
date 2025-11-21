@@ -14,13 +14,12 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # 50 threads is the safe sweet spot for a single novel
-        self.init_executor(50)
+        # 40 threads is a stable maximum for long-running tasks
+        self.init_executor(40)
         self.cleaner.bad_css.update({'div[align="center"]'})
 
-        # Robust connection strategy
         retry = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
 
@@ -28,36 +27,30 @@ class FanMTLCrawler(Crawler):
         logger.debug("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
-        # --- METADATA ---
-        title_node = soup.select_one("h1.novel-title")
-        self.novel_title = title_node.text.strip() if title_node else "Unknown Novel"
+        possible_title = soup.select_one("h1.novel-title")
+        self.novel_title = possible_title.text.strip() if possible_title else "Unknown Novel"
 
-        # Cover: Prioritize figure, fallback to generic
-        img = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
-        if img:
-            url = img.get("src")
-            if "placeholder" in str(url) and img.get("data-src"):
-                url = img.get("data-src")
+        img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
+        if img_tag:
+            url = img_tag.get("src")
+            if "placeholder" in str(url) and img_tag.get("data-src"):
+                url = img_tag.get("data-src")
             self.novel_cover = self.absolute_url(url)
 
-        # Author: Filter out URL junk
-        author_node = soup.select_one('.novel-info .author span[itemprop="author"]')
-        if author_node:
-            text = author_node.text.strip()
+        author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
+        if author_tag:
+            text = author_tag.text.strip()
             self.novel_author = "Unknown" if "http" in text or "fanmtl" in text.lower() else text
         else:
             self.novel_author = "Unknown"
 
-        # Summary
-        summary_node = soup.select_one(".summary .content")
-        self.novel_synopsis = summary_node.get_text("\n\n").strip() if summary_node else ""
+        summary_div = soup.select_one(".summary .content")
+        self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
 
-        # --- CHAPTERS ---
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        
         if not pagination:
             self.parse_chapter_list(soup)
         else:
@@ -66,7 +59,6 @@ class FanMTLCrawler(Crawler):
             params = parse_qs(urlparse(last_page["href"]).query)
             
             try:
-                # Fetch all TOC pages concurrently
                 page_count = int(params.get("page", [0])[0]) + 1
                 wjm = params.get("wjm", [""])[0]
                 
@@ -75,9 +67,11 @@ class FanMTLCrawler(Crawler):
                     url = f"{common_url}?page={page}&wjm={wjm}"
                     futures.append(self.executor.submit(self.get_soup, url))
                 
+                # Use a generator to process results as they arrive to save memory
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
             except Exception:
+                logger.exception("Pagination failed")
                 self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"])
@@ -97,5 +91,4 @@ class FanMTLCrawler(Crawler):
         soup = self.get_soup(chapter["url"])
         body = soup.select_one("#chapter-article .chapter-content")
         if not body: return None
-        # Correct usage: extract_contents
         return self.cleaner.extract_contents(body)
