@@ -1,11 +1,11 @@
 import os
-import json
 import logging
 import asyncio
 import queue
 import time
 import urllib3
 import gc
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update
 from telegram.ext import (
@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import pymongo
 
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
@@ -24,13 +25,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-THREADS_PER_NOVEL = 50 # Safe high speed for single novel
+MONGO_URL = os.getenv("MONGO_URL")  # Connection String from Northflank
+THREADS_PER_NOVEL = 50
 DATA_DIR = "data"
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
-PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
-ERRORS_FILE = os.path.join(DATA_DIR, "errors.json")
-# The persistent queue file
-QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,66 +37,101 @@ class NovelBot:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="bot_worker")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        self.load_history()
+        
+        # --- MongoDB Connection ---
+        if not MONGO_URL:
+            logger.error("❌ MONGO_URL environment variable is missing!")
+            exit(1)
+            
+        try:
+            self.client = pymongo.MongoClient(MONGO_URL)
+            self.db = self.client.get_database("lncrawl_bot")
+            
+            # Collections
+            self.col_history = self.db.history      # Successfully processed
+            self.col_queue = self.db.queue          # Pending jobs
+            self.col_errors = self.db.errors        # Error logs
+            
+            # Create indexes for speed
+            self.col_history.create_index("url", unique=True)
+            self.col_queue.create_index([("status", 1), ("created_at", 1)])
+            
+            logger.info("✅ Connected to MongoDB")
+        except Exception as e:
+            logger.error(f"❌ MongoDB Connection Failed: {e}")
+            exit(1)
 
-    def load_history(self):
-        self.processed = set()
-        self.errors = {}
-        if os.path.exists(PROCESSED_FILE):
-            try:
-                with open(PROCESSED_FILE, 'r') as f: self.processed = set(json.load(f))
-            except: pass
-        if os.path.exists(ERRORS_FILE):
-            try:
-                with open(ERRORS_FILE, 'r') as f: self.errors = json.load(f)
-            except: pass
+    # --- DB HELPERS ---
+    def is_processed(self, url):
+        return self.col_history.find_one({"url": url}) is not None
 
-    def save_success(self, url):
-        self.processed.add(url)
-        if url in self.errors:
-            del self.errors[url]
-            self.save_errors()
-        with open(PROCESSED_FILE, 'w') as f: json.dump(list(self.processed), f, indent=2)
+    def add_to_history(self, url, chat_id, file_name):
+        self.col_history.update_one(
+            {"url": url},
+            {"$set": {
+                "processed_at": datetime.utcnow(),
+                "chat_id": chat_id,
+                "file": file_name
+            }},
+            upsert=True
+        )
 
-    def save_errors(self):
-        with open(ERRORS_FILE, 'w') as f: json.dump(self.errors, f, indent=2)
+    def log_error(self, url, error_msg):
+        self.col_errors.insert_one({
+            "url": url,
+            "error": str(error_msg),
+            "timestamp": datetime.utcnow()
+        })
 
-    def save_error(self, url, error_msg):
-        self.errors[url] = str(error_msg)
-        self.save_errors()
+    def get_pending_queue(self):
+        """Fetch all pending jobs sorted by creation time"""
+        return list(self.col_queue.find({"status": "pending"}).sort("created_at", 1))
 
-    # --- AUTO RESUME ON STARTUP ---
+    def add_queue_items(self, chat_id, urls):
+        docs = []
+        for url in urls:
+            # Skip if already queued or processed
+            if self.is_processed(url): continue
+            if self.col_queue.find_one({"url": url, "status": "pending"}): continue
+            
+            docs.append({
+                "chat_id": chat_id,
+                "url": url,
+                "status": "pending",
+                "created_at": datetime.utcnow()
+            })
+        
+        if docs:
+            self.col_queue.insert_many(docs)
+        return len(docs)
+
+    def mark_queue_done(self, url):
+        self.col_queue.delete_many({"url": url})
+
+    # --- BOT LOGIC ---
     async def post_init(self, application: Application):
-        """Checks for an unfinished queue file on boot."""
-        if os.path.exists(QUEUE_FILE):
-            try:
-                logger.info("📂 Found valid queue file. Resuming...")
-                with open(QUEUE_FILE, 'r') as f:
-                    data = json.load(f)
-                
-                if "chat_id" in data and "urls" in data:
-                    chat_id = data["chat_id"]
-                    urls = data["urls"]
-                    
-                    # Calculate what's left
-                    pending = [u for u in urls if u not in self.processed]
-                    
-                    if pending:
-                        await application.bot.send_message(
-                            chat_id, 
-                            f"🔄 **Bot Restarted**\nFound saved queue.\nResuming {len(pending)} novels..."
-                        )
-                        # Start processing in background
-                        asyncio.create_task(self.process_queue(chat_id, urls, application.bot))
-                    else:
-                        logger.info("Queue exists but all novels processed. Deleting.")
-                        os.remove(QUEUE_FILE)
-            except Exception as e:
-                logger.error(f"Auto-resume failed: {e}")
+        """Checks for pending MongoDB queue items on boot."""
+        pending = self.get_pending_queue()
+        if pending:
+            # Group by chat_id to notify users
+            chats = set(item['chat_id'] for item in pending)
+            for chat_id in chats:
+                try:
+                    count = sum(1 for i in pending if i['chat_id'] == chat_id)
+                    await application.bot.send_message(
+                        chat_id, 
+                        f"🔄 **Bot Restarted**\nFound {count} pending novels in database.\nResuming..."
+                    )
+                except: pass
+            
+            # Resume processing
+            asyncio.create_task(self.process_global_queue(application.bot))
 
     def start(self):
-        if not TOKEN: return
-        # Hook post_init to run resume logic
+        if not TOKEN: 
+            print("❌ TELEGRAM_TOKEN missing")
+            return
+
         application = Application.builder().token(TOKEN).post_init(self.post_init).build()
         
         application.add_handler(CommandHandler("start", self.cmd_start))
@@ -111,13 +144,13 @@ class NovelBot:
         application.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nProcessed: {len(self.processed)}")
+        count = self.col_history.count_documents({})
+        await update.message.reply_text(f"⚡ **FanMTL Bot (MongoDB Edition)** ⚡\nProcessed in History: {count}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.processed = set()
-        if os.path.exists(PROCESSED_FILE): os.remove(PROCESSED_FILE)
-        if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
-        await update.message.reply_text("🗑️ History & Queue Reset.")
+        # Only clears queue, optionally clear history if really needed
+        deleted = self.col_queue.delete_many({})
+        await update.message.reply_text(f"🗑️ Queue cleared. Removed {deleted.deleted_count} pending items.")
 
     async def handle_json_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         document = update.message.document
@@ -126,48 +159,53 @@ class NovelBot:
         await file.download_to_drive(temp_path)
         
         try:
+            import json
             with open(temp_path, 'r', encoding='utf-8') as f: urls = json.load(f)
             
-            # --- SAVE PERSISTENT QUEUE ---
-            queue_data = {
-                "chat_id": update.effective_chat.id,
-                "urls": urls
-            }
-            with open(QUEUE_FILE, 'w') as f:
-                json.dump(queue_data, f, indent=2)
-            # -----------------------------
-
-            await self.process_queue(update.effective_chat.id, urls, context.bot)
+            added_count = self.add_queue_items(update.effective_chat.id, urls)
+            
+            await update.message.reply_text(f"📥 **Imported:** {added_count} new novels to queue.")
+            
+            # Trigger processing
+            asyncio.create_task(self.process_global_queue(context.bot))
 
         except Exception as e:
             logger.error(f"File Error: {e}")
-            await update.message.reply_text("❌ File Error")
+            await update.message.reply_text("❌ File Error: Invalid JSON")
         finally:
             if os.path.exists(temp_path): os.remove(temp_path)
 
-    async def process_queue(self, chat_id, urls, bot):
-        """Iterates through the queue sequentially."""
-        to_process = [u for u in urls if u not in self.processed]
-        
-        if not to_process:
-            await bot.send_message(chat_id, "✅ **Queue Complete**")
-            if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
-            return
-
-        await bot.send_message(chat_id, f"📥 **Queue Started**\nPending: {len(to_process)}")
-        
-        for url in to_process:
-            # Double check in case of race condition
-            if url in self.processed: continue
+    async def process_global_queue(self, bot):
+        """Reads from MongoDB and processes items one by one."""
+        while True:
+            # Fetch one pending item
+            item = self.col_queue.find_one_and_update(
+                {"status": "pending"},
+                {"$set": {"status": "processing"}},
+                sort=[("created_at", 1)]
+            )
             
-            await self.process_novel(url, chat_id, bot)
-            gc.collect() # Free memory
-        
-        # If we reach here, queue is done
-        await bot.send_message(chat_id, "✅ **All Tasks Finished**")
-        if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
+            if not item:
+                break # Queue empty
+
+            chat_id = item['chat_id']
+            url = item['url']
+            
+            try:
+                await self.process_novel(url, chat_id, bot)
+            except Exception as e:
+                logger.error(f"Queue Worker Error: {e}")
+            finally:
+                # Remove from queue regardless of success/fail (History/Errors handle the record)
+                self.mark_queue_done(url)
+                gc.collect()
 
     async def process_novel(self, url: str, chat_id: int, bot):
+        # Final check against history to avoid duplicate work
+        if self.is_processed(url):
+            await bot.send_message(chat_id, f"⏩ **Already Processed:** {url}")
+            return
+
         status_msg = await bot.send_message(chat_id, f"⏳ **Starting:** {url}")
         progress_queue = queue.Queue()
         loop = asyncio.get_running_loop()
@@ -194,26 +232,27 @@ class NovelBot:
             
             if epub_path and os.path.exists(epub_path):
                 file_size = os.path.getsize(epub_path) / (1024 * 1024)
+                file_name = os.path.basename(epub_path)
                 
-                # Clean up status message
                 try: await status_msg.delete()
                 except: pass
 
                 await bot.send_document(
                     chat_id=chat_id,
                     document=open(epub_path, 'rb'),
-                    caption=f"📕 {os.path.basename(epub_path)}\n📦 {file_size:.1f}MB | ⏱️ {duration}s"
+                    caption=f"📕 {file_name}\n📦 {file_size:.1f}MB | ⏱️ {duration}s"
                 )
                 
-                self.save_success(url)
+                self.add_to_history(url, chat_id, file_name)
                 os.remove(epub_path)
             else: 
                 await status_msg.edit_text(f"❌ Failed to generate file for {url}")
+                self.log_error(url, "No file generated")
         except Exception as e:
             logger.error(f"Fail: {url} -> {e}")
             try: await status_msg.edit_text(f"❌ Error: {e}")
             except: await bot.send_message(chat_id, f"❌ Error: {e}")
-            self.save_error(url, str(e))
+            self.log_error(url, str(e))
 
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
@@ -225,7 +264,7 @@ class NovelBot:
             
             if app.crawler: app.crawler.init_executor(THREADS_PER_NOVEL)
 
-            # Cover
+            # Cover Logic (Same as before)
             if app.crawler.novel_cover:
                 try:
                     headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
@@ -247,13 +286,11 @@ class NovelBot:
                 if i % 40 == 0: 
                     progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
             
-            # --- INTEGRITY REPAIR & SEND ANYWAY ---
+            # --- INTEGRITY REPAIR ---
             failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
             if failed:
                 progress_queue.put(f"⚠️ Missing {len(failed)} chapters. Retrying...")
-                # Retry once
                 app.crawler.download_chapters(failed)
-                # Final Check
                 failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
                 if failed:
                      progress_queue.put(f"⚠️ Sending incomplete file (Missing {len(failed)}).")
