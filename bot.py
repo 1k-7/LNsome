@@ -36,7 +36,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 # Threshold to switch to Userbot (in MB)
 USERBOT_THRESHOLD = 40.0 
 
-DATA_DIR = "data"
+DATA_DIR = os.getenv("DATA_DIR", data)
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
 ERRORS_FILE = os.path.join(DATA_DIR, "errors.json")
