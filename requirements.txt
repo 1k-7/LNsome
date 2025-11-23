@@ -64,3 +64,7 @@ types-passlib
 types-python-jose
 types-setuptools
 lxml-stubs
+
+#tg 50mb
+pyrogram
+tgcrypto
