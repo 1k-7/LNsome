@@ -558,8 +558,9 @@ class NovelBot:
                 self.save_genfail()
                 await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
         except Exception as e:
-            # Handle the specific "No chapters" exception from the worker
-            if "No chapters extracted" in str(e):
+            # Handle the specific "No chapters" exception from the worker (or index error)
+            err_str = str(e)
+            if "No chapters extracted" in err_str or "IndexError" in err_str:
                 self.nullcon.add(url)
                 self.save_nullcon()
                 try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
@@ -616,7 +617,15 @@ class NovelBot:
                 for c in failed: c.body = f"<h1>Chapter {c.id}</h1><p><i>[Content Missing]</i></p>"
 
             progress_queue.put("📦 Binding...")
-            for fmt, f in app.bind_books(): return f
+            
+            # DEFENSIVE FIX: Catch IndexError here specifically for binding
+            try:
+                for fmt, f in app.bind_books(): return f
+            except IndexError:
+                # This catches the case where app.chapters somehow becomes empty
+                # or app.py throws "list index out of range"
+                raise Exception("No chapters extracted (IndexError during binding)")
+                
             return None
 
         except Exception as e: raise e
