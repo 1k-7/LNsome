@@ -30,7 +30,9 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-THREADS_PER_NOVEL = 50
+# REDUCED: 50 threads per novel is overkill and eats RAM. 
+# 8 is the sweet spot for speed vs memory.
+THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -60,7 +62,9 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="bot_worker")
+        # REDUCED: Only process 2 novels at once. 
+        # Processing 5 concurrent heavy crawls is what spikes usage to GBs.
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
         
         self.userbot = None
         self.bot_username = None 
@@ -397,6 +401,9 @@ class NovelBot:
             if os.path.exists(temp_path): os.remove(temp_path)
 
     async def process_queue(self, urls, bot):
+        # Explicit garbage collection before starting a large batch
+        gc.collect()
+        
         to_process = [u for u in urls if u not in self.processed]
         if not to_process:
             if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
@@ -408,6 +415,7 @@ class NovelBot:
         for url in to_process:
             if url in self.processed: continue
             await self.process_novel(url, bot)
+            # Explicit garbage collection after each novel to free memory immediately
             gc.collect()
         
         await self.send_log(bot, "✅ **All Tasks Finished**")
@@ -505,7 +513,8 @@ class NovelBot:
             if app.crawler.novel_cover:
                 try:
                     headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
-                    response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=15)
+                    # REDUCED: Timeout reduced from 15s to 10s to free resources faster
+                    response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=10)
                     if response.status_code == 200:
                         cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
                         with open(cover_path, 'wb') as f: f.write(response.content)
@@ -535,7 +544,9 @@ class NovelBot:
 
         except Exception as e: raise e
         finally: 
+            # CRITICAL: Clean up heavy objects immediately
             app.destroy()
+            del app
             gc.collect()
 
 if __name__ == "__main__":
