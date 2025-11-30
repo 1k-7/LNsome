@@ -37,7 +37,6 @@ TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID")
 ERROR_GROUP_ID = os.getenv("ERROR_GROUP_ID")   
 
 # --- MANUAL OVERRIDES (Failsafe) ---
-# If file saving fails, put your Topic IDs here in .env
 FORCE_TARGET_TOPIC_ID = os.getenv("FORCE_TARGET_TOPIC_ID")
 FORCE_ERROR_TOPIC_ID = os.getenv("FORCE_ERROR_TOPIC_ID")
 
@@ -70,7 +69,7 @@ class NovelBot:
         self.processed = set()
         self.errors = {}
         
-        # Topic IDs (Initialize from ENV first)
+        # Topic IDs
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
         self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
         self.backup_topic_id = None
@@ -83,7 +82,7 @@ class NovelBot:
         return os.path.join(DATA_DIR, f"{name}_{self.bot_username}.json")
 
     def load_data(self):
-        """Loads data with verbose error logging"""
+        """Loads data with verbose error logging and migration support"""
         
         # --- 1. Load Processed Novels ---
         if os.path.exists(self.files['processed']):
@@ -96,6 +95,7 @@ class NovelBot:
                 with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
                     self.processed = set(json.load(f))
                 logger.info("♻️ Migrated processed.json")
+                # We don't save immediately to avoid race conditions, will save on next write
             except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
 
         # --- 2. Load Errors ---
@@ -105,11 +105,10 @@ class NovelBot:
             except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
 
         # --- 3. Load Topics (Critical) ---
-        # Only load from file if NOT forced by Env Vars
         if not self.target_topic_id or not self.error_topic_id:
             loaded = False
             
-            # A. Check New Specific File: topics_Username.json
+            # A. Check New Specific File
             if os.path.exists(self.files['topics']):
                 try:
                     with open(self.files['topics'], 'r') as f:
@@ -122,7 +121,7 @@ class NovelBot:
                 except Exception as e: 
                     logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
 
-            # B. Check Legacy File: topics.json (Migration)
+            # B. Check Legacy File (Migration)
             if not loaded:
                 legacy_path = os.path.join(DATA_DIR, "topics.json")
                 if os.path.exists(legacy_path):
@@ -135,8 +134,6 @@ class NovelBot:
                             logger.info(f"♻️ Migrated Topics from legacy topics.json")
                     except Exception as e: 
                         logger.error(f"❌ CRITICAL: Found legacy topics.json but could not read it: {e}")
-                else:
-                    logger.info("ℹ️ No previous topics file found.")
 
     def save_topics(self):
         """Saves current topic IDs to namespaced file"""
@@ -147,9 +144,9 @@ class NovelBot:
                     "error_topic_id": self.error_topic_id,
                     "backup_topic_id": self.backup_topic_id
                 }, f, indent=2)
-            logger.info(f"💾 Topics Saved to {self.files['topics']}")
+            logger.info(f"💾 Topics Saved to {os.path.basename(self.files['topics'])}")
         except Exception as e:
-            logger.error(f"❌ Could not save topics to {self.files['topics']}: {e}")
+            logger.error(f"❌ Could not save topics: {e}")
 
     def save_success(self, url):
         self.processed.add(url)
@@ -194,7 +191,7 @@ class NovelBot:
             try:
                 # Target Topic
                 if not self.target_topic_id:
-                    logger.info("🆕 Creating Target Topic (ID was missing)...")
+                    logger.info("🆕 Creating Target Topic...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=TARGET_GROUP_ID, 
                         name=f"📚 {self.bot_username} Novels"
@@ -204,7 +201,7 @@ class NovelBot:
                 
                 # Error Topic
                 if not self.error_topic_id:
-                    logger.info("🆕 Creating Error/Log Topic (ID was missing)...")
+                    logger.info("🆕 Creating Error/Log Topic...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=ERROR_GROUP_ID, 
                         name=f"🛠 {self.bot_username} Logs"
@@ -214,7 +211,7 @@ class NovelBot:
 
                 # Backup Topic
                 if not self.backup_topic_id:
-                    logger.info("🆕 Creating Backup Topic (ID was missing)...")
+                    logger.info("🆕 Creating Backup Topic...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=ERROR_GROUP_ID, 
                         name=f"🗄️ {self.bot_username} Backup"
@@ -226,7 +223,7 @@ class NovelBot:
                 if topics_changed or not os.path.exists(self.files['topics']):
                     self.save_topics() 
                 
-                logger.info(f"🎯 Configuration: Target={self.target_topic_id} | Logs={self.error_topic_id} | Backup={self.backup_topic_id}")
+                logger.info(f"🎯 Configuration: Target={self.target_topic_id} | Logs={self.error_topic_id}")
 
             except Exception as e:
                 logger.error(f"❌ Failed to configure topics: {e}")
@@ -249,19 +246,36 @@ class NovelBot:
         # 6. Start Background Tasks
         asyncio.create_task(self.backup_loop(application.bot))
 
-        # 7. Resume Pending Queue
-        if os.path.exists(self.files['queue']):
+        # 7. Resume Pending Queue (With MIGRATION Logic)
+        queue_path = self.files['queue']
+        legacy_queue_path = os.path.join(DATA_DIR, "queue.json")
+
+        # Check if legacy queue exists and new queue doesn't
+        if not os.path.exists(queue_path) and os.path.exists(legacy_queue_path):
+            logger.info("♻️ Migrating legacy queue.json to new format...")
             try:
-                with open(self.files['queue'], 'r') as f: data = json.load(f)
+                shutil.move(legacy_queue_path, queue_path)
+            except Exception as e:
+                logger.error(f"❌ Queue Migration Failed: {e}")
+
+        # Process the queue if it exists
+        if os.path.exists(queue_path):
+            try:
+                with open(queue_path, 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 pending = [u for u in urls if u not in self.processed]
+                
                 if pending:
                     msg = f"🔄 **Restarted**\nResuming {len(pending)} novels..."
                     await self.send_log(application.bot, msg)
                     asyncio.create_task(self.process_queue(urls, application.bot))
                 else:
-                    os.remove(self.files['queue'])
-            except: pass
+                    logger.info("✅ Queue file found but all novels processed. Cleaning up.")
+                    os.remove(queue_path)
+            except Exception as e:
+                logger.error(f"❌ Error processing queue file: {e}")
+        else:
+            logger.info("ℹ️ No pending queue found.")
 
     # --- HELPER: Send Log ---
     async def send_log(self, bot, text, edit_msg=None):
@@ -292,7 +306,7 @@ class NovelBot:
             zip_name = f"backup_{self.bot_username}_{timestamp}.zip"
             zip_path = os.path.join(DATA_DIR, zip_name)
             
-            # Backup only THIS bot's files (based on username in filename)
+            # Backup only THIS bot's files
             files_to_backup = [
                 f for f in os.listdir(DATA_DIR) 
                 if f.endswith('.json') 
