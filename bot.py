@@ -32,23 +32,27 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 THREADS_PER_NOVEL = 50
 
-# Group Configs
-TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") # For Novels
-ERROR_GROUP_ID = os.getenv("ERROR_GROUP_ID")   # For Logs/Progress/Errors
+# Group Configs (Must be -100xxxx format)
+TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
+ERROR_GROUP_ID = os.getenv("ERROR_GROUP_ID")   
+
+# --- MANUAL OVERRIDES (Failsafe) ---
+# If file saving fails, put your Topic IDs here in .env
+FORCE_TARGET_TOPIC_ID = os.getenv("FORCE_TARGET_TOPIC_ID")
+FORCE_ERROR_TOPIC_ID = os.getenv("FORCE_ERROR_TOPIC_ID")
 
 # Userbot Config
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-# Threshold to switch to Userbot (in MB)
 USERBOT_THRESHOLD = 40.0 
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
-PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
-ERRORS_FILE = os.path.join(DATA_DIR, "errors.json")
-QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
-TOPICS_FILE = os.path.join(DATA_DIR, "topics.json")
+
+# Ensure Data Directory Exists
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,101 +62,176 @@ pending_uploads = {}
 class NovelBot:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="bot_worker")
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        self.load_history()
-        self.userbot = None
-        self.bot_username = None
         
-        # Topic IDs (Thread IDs)
-        self.target_topic_id = None
-        self.error_topic_id = None
-        self.backup_topic_id = None
-
-    def load_history(self):
+        self.userbot = None
+        self.bot_username = None 
+        
+        # State
         self.processed = set()
         self.errors = {}
-        if os.path.exists(PROCESSED_FILE):
-            try:
-                with open(PROCESSED_FILE, 'r') as f: self.processed = set(json.load(f))
-            except: pass
-        if os.path.exists(ERRORS_FILE):
-            try:
-                with open(ERRORS_FILE, 'r') as f: self.errors = json.load(f)
-            except: pass
         
-        # Load Topic IDs
-        if os.path.exists(TOPICS_FILE):
+        # Topic IDs (Initialize from ENV first)
+        self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
+        self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
+        self.backup_topic_id = None
+
+        # File Paths (Set in post_init)
+        self.files = {}
+
+    def get_file_path(self, name):
+        """Generates a namespaced file path: data/name_BotUsername.json"""
+        return os.path.join(DATA_DIR, f"{name}_{self.bot_username}.json")
+
+    def load_data(self):
+        """Loads data with verbose error logging"""
+        
+        # --- 1. Load Processed Novels ---
+        if os.path.exists(self.files['processed']):
             try:
-                with open(TOPICS_FILE, 'r') as f:
-                    data = json.load(f)
-                    self.target_topic_id = data.get("target_topic_id")
-                    self.error_topic_id = data.get("error_topic_id")
-                    self.backup_topic_id = data.get("backup_topic_id")
-            except: pass
+                with open(self.files['processed'], 'r') as f: self.processed = set(json.load(f))
+            except Exception as e: logger.error(f"⚠️ Load Processed Failed: {e}")
+        # Legacy check
+        elif os.path.exists(os.path.join(DATA_DIR, "processed.json")):
+            try:
+                with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
+                    self.processed = set(json.load(f))
+                logger.info("♻️ Migrated processed.json")
+            except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
+
+        # --- 2. Load Errors ---
+        if os.path.exists(self.files['errors']):
+            try:
+                with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
+            except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
+
+        # --- 3. Load Topics (Critical) ---
+        # Only load from file if NOT forced by Env Vars
+        if not self.target_topic_id or not self.error_topic_id:
+            loaded = False
+            
+            # A. Check New Specific File: topics_Username.json
+            if os.path.exists(self.files['topics']):
+                try:
+                    with open(self.files['topics'], 'r') as f:
+                        data = json.load(f)
+                        if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
+                        if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
+                        self.backup_topic_id = data.get("backup_topic_id")
+                        loaded = True
+                        logger.info(f"✅ Loaded Topics from {os.path.basename(self.files['topics'])}")
+                except Exception as e: 
+                    logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
+
+            # B. Check Legacy File: topics.json (Migration)
+            if not loaded:
+                legacy_path = os.path.join(DATA_DIR, "topics.json")
+                if os.path.exists(legacy_path):
+                    try:
+                        with open(legacy_path, 'r') as f:
+                            data = json.load(f)
+                            if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
+                            if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
+                            self.backup_topic_id = data.get("backup_topic_id")
+                            logger.info(f"♻️ Migrated Topics from legacy topics.json")
+                    except Exception as e: 
+                        logger.error(f"❌ CRITICAL: Found legacy topics.json but could not read it: {e}")
+                else:
+                    logger.info("ℹ️ No previous topics file found.")
+
+    def save_topics(self):
+        """Saves current topic IDs to namespaced file"""
+        try:
+            with open(self.files['topics'], 'w') as f:
+                json.dump({
+                    "target_topic_id": self.target_topic_id,
+                    "error_topic_id": self.error_topic_id,
+                    "backup_topic_id": self.backup_topic_id
+                }, f, indent=2)
+            logger.info(f"💾 Topics Saved to {self.files['topics']}")
+        except Exception as e:
+            logger.error(f"❌ Could not save topics to {self.files['topics']}: {e}")
 
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors:
             del self.errors[url]
             self.save_errors()
-        with open(PROCESSED_FILE, 'w') as f: json.dump(list(self.processed), f, indent=2)
+        try:
+            with open(self.files['processed'], 'w') as f: 
+                json.dump(list(self.processed), f, indent=2)
+        except Exception as e: logger.error(f"⚠️ Save Success Failed: {e}")
 
     def save_errors(self):
-        with open(ERRORS_FILE, 'w') as f: json.dump(self.errors, f, indent=2)
+        try:
+            with open(self.files['errors'], 'w') as f: 
+                json.dump(self.errors, f, indent=2)
+        except Exception as e: logger.error(f"⚠️ Save Errors Failed: {e}")
 
     def save_error(self, url, error_msg):
         self.errors[url] = str(error_msg)
         self.save_errors()
         
-    def save_topics(self):
-        with open(TOPICS_FILE, 'w') as f:
-            json.dump({
-                "target_topic_id": self.target_topic_id,
-                "error_topic_id": self.error_topic_id,
-                "backup_topic_id": self.backup_topic_id
-            }, f, indent=2)
-
     async def post_init(self, application: Application):
+        # 1. Identify Self
         me = await application.bot.get_me()
         self.bot_username = me.username
-        logger.info(f"🤖 Bot Username: @{self.bot_username}")
+        logger.info(f"🤖 Identity Verified: @{self.bot_username}")
 
-        # --- SETUP TOPICS ---
+        # 2. Setup Namespaced File Paths
+        self.files = {
+            'processed': self.get_file_path("processed"),
+            'errors': self.get_file_path("errors"),
+            'queue': self.get_file_path("queue"),
+            'topics': self.get_file_path("topics")
+        }
+
+        # 3. Load Persistent Data
+        self.load_data()
+
+        # 4. Auto-Configure Topics
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
+            topics_changed = False
             try:
-                # 1. Target Topic (Novels)
+                # Target Topic
                 if not self.target_topic_id:
-                    logger.info("Creating Target Topic...")
+                    logger.info("🆕 Creating Target Topic (ID was missing)...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=TARGET_GROUP_ID, 
                         name=f"📚 {self.bot_username} Novels"
                     )
                     self.target_topic_id = topic.message_thread_id
+                    topics_changed = True
                 
-                # 2. Error/Log Topic
+                # Error Topic
                 if not self.error_topic_id:
-                    logger.info("Creating Error/Log Topic...")
+                    logger.info("🆕 Creating Error/Log Topic (ID was missing)...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=ERROR_GROUP_ID, 
                         name=f"🛠 {self.bot_username} Logs"
                     )
                     self.error_topic_id = topic.message_thread_id
+                    topics_changed = True
 
-                # 3. Backup Topic
+                # Backup Topic
                 if not self.backup_topic_id:
-                    logger.info("Creating Backup Topic...")
+                    logger.info("🆕 Creating Backup Topic (ID was missing)...")
                     topic = await application.bot.create_forum_topic(
                         chat_id=ERROR_GROUP_ID, 
                         name=f"🗄️ {self.bot_username} Backup"
                     )
                     self.backup_topic_id = topic.message_thread_id
+                    topics_changed = True
                 
-                self.save_topics()
-                logger.info(f"✅ Topics Configured. Target: {self.target_topic_id}, Backup: {self.backup_topic_id}")
-            except Exception as e:
-                logger.error(f"❌ Failed to create/load topics: {e}")
+                # Force save if we created new topics OR if we just migrated
+                if topics_changed or not os.path.exists(self.files['topics']):
+                    self.save_topics() 
+                
+                logger.info(f"🎯 Configuration: Target={self.target_topic_id} | Logs={self.error_topic_id} | Backup={self.backup_topic_id}")
 
-        # --- USERBOT SETUP ---
+            except Exception as e:
+                logger.error(f"❌ Failed to configure topics: {e}")
+
+        # 5. Connect Userbot
         if SESSION_STRING and API_ID:
             try:
                 self.userbot = UserBotClient(
@@ -163,19 +242,17 @@ class NovelBot:
                     in_memory=True
                 )
                 await self.userbot.start()
-                logger.info("✅ Userbot Connected! Large file support ready.")
+                logger.info("✅ Userbot Connected!")
             except Exception as e:
                 logger.error(f"❌ Userbot Failed: {e}")
 
-        # --- START BACKGROUND TASKS ---
-        # 1. Backup Scheduler (Starts after 1 hour, then every 24h)
+        # 6. Start Background Tasks
         asyncio.create_task(self.backup_loop(application.bot))
 
-        # 2. Resume Queue
-        if os.path.exists(QUEUE_FILE):
+        # 7. Resume Pending Queue
+        if os.path.exists(self.files['queue']):
             try:
-                with open(QUEUE_FILE, 'r') as f: data = json.load(f)
-                chat_id = data.get("chat_id") # Original requester
+                with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 pending = [u for u in urls if u not in self.processed]
                 if pending:
@@ -183,18 +260,29 @@ class NovelBot:
                     await self.send_log(application.bot, msg)
                     asyncio.create_task(self.process_queue(urls, application.bot))
                 else:
-                    os.remove(QUEUE_FILE)
+                    os.remove(self.files['queue'])
             except: pass
+
+    # --- HELPER: Send Log ---
+    async def send_log(self, bot, text, edit_msg=None):
+        if ERROR_GROUP_ID and self.error_topic_id:
+            try:
+                if edit_msg:
+                    return await edit_msg.edit_text(text)
+                return await bot.send_message(
+                    chat_id=ERROR_GROUP_ID, 
+                    message_thread_id=self.error_topic_id, 
+                    text=text
+                )
+            except: pass 
+        return None
 
     # --- BACKUP SYSTEM ---
     async def backup_loop(self, bot):
-        # Initial wait to let bot start up properly (e.g., 60 seconds)
-        await asyncio.sleep(60)
-        
+        await asyncio.sleep(60) # Initial Delay
         while True:
             await self.perform_backup(bot)
-            # Wait 24 hours (86400 seconds)
-            await asyncio.sleep(86400)
+            await asyncio.sleep(86400) # 24 Hours
 
     async def perform_backup(self, bot):
         if not ERROR_GROUP_ID or not self.backup_topic_id: return
@@ -204,10 +292,12 @@ class NovelBot:
             zip_name = f"backup_{self.bot_username}_{timestamp}.zip"
             zip_path = os.path.join(DATA_DIR, zip_name)
             
-            # Identify all JSON files in data dir (queue, errors, processed, topics, etc.)
+            # Backup only THIS bot's files (based on username in filename)
             files_to_backup = [
                 f for f in os.listdir(DATA_DIR) 
-                if f.endswith('.json') and os.path.isfile(os.path.join(DATA_DIR, f))
+                if f.endswith('.json') 
+                and self.bot_username in f
+                and os.path.isfile(os.path.join(DATA_DIR, f))
             ]
             
             if not files_to_backup: return
@@ -231,7 +321,6 @@ class NovelBot:
                     caption=caption
                 )
             
-            # Clean up local zip
             if os.path.exists(zip_path): os.remove(zip_path)
             logger.info("✅ Backup uploaded successfully")
             
@@ -239,27 +328,14 @@ class NovelBot:
             logger.error(f"Backup Failed: {e}")
             await self.send_log(bot, f"⚠️ Backup Failed: {e}")
 
-    # Helper to send to Error/Log Group
-    async def send_log(self, bot, text, edit_msg=None):
-        if ERROR_GROUP_ID and self.error_topic_id:
-            try:
-                if edit_msg:
-                    return await edit_msg.edit_text(text)
-                return await bot.send_message(
-                    chat_id=ERROR_GROUP_ID, 
-                    message_thread_id=self.error_topic_id, 
-                    text=text
-                )
-            except: pass 
-        return None
-
+    # --- BOT LOGIC ---
     def start(self):
         if not TOKEN: return
         app = Application.builder().token(TOKEN).post_init(self.post_init).build()
         
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
-        app.add_handler(CommandHandler("backup", self.cmd_force_backup)) # Added command for manual backup
+        app.add_handler(CommandHandler("backup", self.cmd_force_backup))
         app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
         
@@ -269,12 +345,12 @@ class NovelBot:
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nProcessed: {len(self.processed)}\n\nLogs -> Group {ERROR_GROUP_ID}\nNovels -> Group {TARGET_GROUP_ID}")
+        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.processed = set()
-        if os.path.exists(PROCESSED_FILE): os.remove(PROCESSED_FILE)
-        if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
+        if os.path.exists(self.files['processed']): os.remove(self.files['processed'])
+        if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
         await update.message.reply_text("🗑️ History Reset.")
 
     async def cmd_force_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,7 +371,7 @@ class NovelBot:
         try:
             with open(temp_path, 'r', encoding='utf-8') as f: urls = json.load(f)
             
-            with open(QUEUE_FILE, 'w') as f:
+            with open(self.files['queue'], 'w') as f:
                 json.dump({"chat_id": update.effective_chat.id, "urls": urls}, f, indent=2)
             
             await update.message.reply_text(f"✅ Received {len(urls)} novels. Check Log Group for progress.")
@@ -309,7 +385,7 @@ class NovelBot:
     async def process_queue(self, urls, bot):
         to_process = [u for u in urls if u not in self.processed]
         if not to_process:
-            if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
+            if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
             await self.send_log(bot, "✅ **Queue Complete**")
             return
 
@@ -321,7 +397,7 @@ class NovelBot:
             gc.collect()
         
         await self.send_log(bot, "✅ **All Tasks Finished**")
-        if os.path.exists(QUEUE_FILE): os.remove(QUEUE_FILE)
+        if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
 
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
@@ -355,7 +431,6 @@ class NovelBot:
                 try: await status_msg.delete()
                 except: pass
 
-                # --- UPLOAD LOGIC ---
                 dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
                 dest_topic_id = self.target_topic_id
 
