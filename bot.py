@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import asyncio
@@ -30,7 +31,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# 8 is the sweet spot for speed vs memory.
+# 8 is the sweet spot for speed vs memory on VPS
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -61,7 +62,7 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
-        # Processing 2 novels concurrent max
+        # Processing 2 novels concurrent max to save RAM
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
         
         self.userbot = None
@@ -372,7 +373,19 @@ class NovelBot:
 
     # --- BOT LOGIC ---
     def start(self):
-        if not TOKEN: return
+        print(f"🚀 Bot Starting...")
+        sys.stdout.flush()
+        
+        # FATAL ERROR CHECK: Explicitly exit with error code if token is missing
+        if not TOKEN:
+            print("❌ FATAL ERROR: TELEGRAM_TOKEN is missing from environment!")
+            print("❌ Check your docker run command or .env file.")
+            sys.stdout.flush()
+            sys.exit(1) # Force Exit 1 to stop restart loop if configured correctly
+
+        print(f"✅ Token Found: {TOKEN[:5]}...{TOKEN[-5:]}")
+        sys.stdout.flush()
+
         app = Application.builder().token(TOKEN).post_init(self.post_init).build()
         
         app.add_handler(CommandHandler("start", self.cmd_start))
@@ -382,8 +395,12 @@ class NovelBot:
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
         
         print("🚀 Loading sources...")
+        sys.stdout.flush()
         load_sources()
+        
         print(f"✅ Bot online! (Threads: {THREADS_PER_NOVEL})")
+        sys.stdout.flush()
+        
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -608,3 +625,9 @@ class NovelBot:
             if app:
                 app.destroy()
                 del app
+            # Explicit GC inside worker to prevent heap growth
+            gc.collect()
+
+if __name__ == "__main__":
+    bot = NovelBot()
+    bot.start()
