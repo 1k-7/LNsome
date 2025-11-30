@@ -51,8 +51,7 @@ class App:
         self.fetch_chapter_progress: float = 0
         self.fetch_images_progress: float = 0
         self.binding_progress: float = 0
-        # LEAK FIX: Removed atexit.register(self.destroy)
-        # This was keeping every App instance alive forever in memory.
+        # REMOVED atexit.register to fix memory leak
 
     @property
     def progress(self):
@@ -78,7 +77,7 @@ class App:
     # ----------------------------------------------------------------------- #
 
     def destroy(self):
-        # LEAK FIX: Removed atexit.unregister(self.destroy)
+        # REMOVED atexit.unregister
         if self.crawler:
             self.crawler.close()
             self.crawler = None
@@ -268,7 +267,6 @@ class App:
         else:
             # FIX: Check if chapters exist before accessing index 0 to prevent crash
             if not self.chapters:
-                logger.warning("No chapters found to bind.")
                 return
 
             first_id = self.chapters[0]["id"]

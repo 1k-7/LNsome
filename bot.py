@@ -31,7 +31,6 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# 8 is the sweet spot for speed vs memory on VPS
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -62,7 +61,6 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
-        # Processing 2 novels concurrent max to save RAM
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
         
         self.userbot = None
@@ -94,6 +92,7 @@ class NovelBot:
             try:
                 with open(self.files['processed'], 'r') as f: self.processed = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Processed Failed: {e}")
+        # Legacy check
         elif os.path.exists(os.path.join(DATA_DIR, "processed.json")):
             try:
                 with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
@@ -122,6 +121,8 @@ class NovelBot:
         # --- 5. Load Topics (Critical) ---
         if not self.target_topic_id or not self.error_topic_id:
             loaded = False
+            
+            # A. Check New Specific File
             if os.path.exists(self.files['topics']):
                 try:
                     with open(self.files['topics'], 'r') as f:
@@ -134,6 +135,7 @@ class NovelBot:
                 except Exception as e: 
                     logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
 
+            # B. Check Legacy File (Migration)
             if not loaded:
                 legacy_path = os.path.join(DATA_DIR, "topics.json")
                 if os.path.exists(legacy_path):
@@ -166,7 +168,7 @@ class NovelBot:
         if url in self.errors: del self.errors[url]
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
-        
+
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
@@ -217,6 +219,7 @@ class NovelBot:
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
             topics_changed = False
             try:
+                # Target Topic
                 if not self.target_topic_id:
                     logger.info("🆕 Creating Target Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -226,6 +229,7 @@ class NovelBot:
                     self.target_topic_id = topic.message_thread_id
                     topics_changed = True
                 
+                # Error Topic
                 if not self.error_topic_id:
                     logger.info("🆕 Creating Error/Log Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -235,6 +239,7 @@ class NovelBot:
                     self.error_topic_id = topic.message_thread_id
                     topics_changed = True
 
+                # Backup Topic
                 if not self.backup_topic_id:
                     logger.info("🆕 Creating Backup Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -244,6 +249,7 @@ class NovelBot:
                     self.backup_topic_id = topic.message_thread_id
                     topics_changed = True
                 
+                # Force save if we created new topics OR if we just migrated
                 if topics_changed or not os.path.exists(self.files['topics']):
                     self.save_topics() 
                 
@@ -274,6 +280,7 @@ class NovelBot:
         queue_path = self.files['queue']
         legacy_queue_path = os.path.join(DATA_DIR, "queue.json")
 
+        # Check if legacy queue exists and new queue doesn't
         if not os.path.exists(queue_path) and os.path.exists(legacy_queue_path):
             logger.info("♻️ Migrating legacy queue.json to new format...")
             try:
@@ -281,6 +288,7 @@ class NovelBot:
             except Exception as e:
                 logger.error(f"❌ Queue Migration Failed: {e}")
 
+        # Process the queue if it exists
         if os.path.exists(queue_path):
             try:
                 with open(queue_path, 'r') as f: data = json.load(f)
@@ -376,15 +384,11 @@ class NovelBot:
         print(f"🚀 Bot Starting...")
         sys.stdout.flush()
         
-        # FATAL ERROR CHECK: Explicitly exit with error code if token is missing
         if not TOKEN:
             print("❌ FATAL ERROR: TELEGRAM_TOKEN is missing from environment!")
             print("❌ Check your docker run command or .env file.")
             sys.stdout.flush()
-            sys.exit(1) # Force Exit 1 to stop restart loop if configured correctly
-
-        print(f"✅ Token Found: {TOKEN[:5]}...{TOKEN[-5:]}")
-        sys.stdout.flush()
+            sys.exit(1)
 
         app = Application.builder().token(TOKEN).post_init(self.post_init).build()
         
@@ -397,10 +401,8 @@ class NovelBot:
         print("🚀 Loading sources...")
         sys.stdout.flush()
         load_sources()
-        
         print(f"✅ Bot online! (Threads: {THREADS_PER_NOVEL})")
         sys.stdout.flush()
-        
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,12 +474,10 @@ class NovelBot:
         await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped_null} null, {skipped_fail} failed)")
         
         for url in to_process:
-            # Double check in case duplicate calls added it mid-run
-            if url in self.processed or url in self.nullcon or url in self.genfail: continue
+            if url in self.processed: continue
             await self.process_novel(url, bot)
+            # gc.collect() - Removed per-novel GC to reduce CPU spike, rely on worker GC
         
-        # Clean once after batch ends
-        gc.collect()
         await self.send_log(bot, "✅ **All Tasks Finished**")
         if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
 
@@ -553,14 +553,13 @@ class NovelBot:
 
                 os.remove(epub_path)
             else:
-                # Generation Failed Case
                 self.genfail.add(url)
                 self.save_genfail()
                 await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
         except Exception as e:
-            # Handle the specific "No chapters" exception from the worker (or index error)
-            err_str = str(e)
-            if "No chapters extracted" in err_str or "IndexError" in err_str:
+            err_msg = str(e)
+            # FIX: Catch "IndexError" explicitly here to log clean "No chapters" message
+            if "No chapters extracted" in err_msg or "IndexError" in err_msg or "list index out of range" in err_msg:
                 self.nullcon.add(url)
                 self.save_nullcon()
                 try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
@@ -572,8 +571,7 @@ class NovelBot:
                 self.save_error(url, str(e))
 
     def _scrape_logic(self, url: str, progress_queue):
-        # Initialize as None so finally block handles instantiation failure safely
-        app = None
+        app = None # Initialize for finally block
         try:
             app = App()
             progress_queue.put(f"🔍 Fetching info...")
@@ -586,7 +584,6 @@ class NovelBot:
             if app.crawler.novel_cover:
                 try:
                     headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
-                    # REDUCED: Timeout reduced from 15s to 10s to free resources faster
                     response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=10)
                     if response.status_code == 200:
                         cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
@@ -595,8 +592,6 @@ class NovelBot:
                 except: pass
 
             app.chapters = app.crawler.chapters[:]
-            
-            # CHECK: Prevent crash if chapters are empty AND signal to main thread
             if not app.chapters:
                 raise Exception("No chapters extracted")
 
@@ -618,23 +613,19 @@ class NovelBot:
 
             progress_queue.put("📦 Binding...")
             
-            # DEFENSIVE FIX: Catch IndexError here specifically for binding
+            # FIX: Catch IndexError here to prevent crash if list becomes empty
             try:
                 for fmt, f in app.bind_books(): return f
             except IndexError:
-                # This catches the case where app.chapters somehow becomes empty
-                # or app.py throws "list index out of range"
-                raise Exception("No chapters extracted (IndexError during binding)")
+                raise Exception("No chapters found (IndexError during binding)")
                 
             return None
 
         except Exception as e: raise e
         finally: 
-            # CRITICAL: Always clean up to prevent leaks
             if app:
                 app.destroy()
                 del app
-            # Explicit GC inside worker to prevent heap growth
             gc.collect()
 
 if __name__ == "__main__":
