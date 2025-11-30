@@ -1,4 +1,3 @@
-import atexit
 import logging
 import os
 from pathlib import Path
@@ -52,7 +51,8 @@ class App:
         self.fetch_chapter_progress: float = 0
         self.fetch_images_progress: float = 0
         self.binding_progress: float = 0
-        atexit.register(self.destroy)
+        # LEAK FIX: Removed atexit.register(self.destroy)
+        # This was keeping every App instance alive forever in memory.
 
     @property
     def progress(self):
@@ -78,7 +78,7 @@ class App:
     # ----------------------------------------------------------------------- #
 
     def destroy(self):
-        atexit.unregister(self.destroy)
+        # LEAK FIX: Removed atexit.unregister(self.destroy)
         if self.crawler:
             self.crawler.close()
             self.crawler = None
@@ -266,6 +266,11 @@ class App:
                     if x["volume"] == vol["id"] and len(x["body"]) > 0
                 ]
         else:
+            # FIX: Check if chapters exist before accessing index 0 to prevent crash
+            if not self.chapters:
+                logger.warning("No chapters found to bind.")
+                return
+
             first_id = self.chapters[0]["id"]
             last_id = self.chapters[-1]["id"]
             data[f"c{first_id}-{last_id}"] = self.chapters
