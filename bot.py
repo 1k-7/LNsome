@@ -564,7 +564,8 @@ class NovelBot:
                 err_msg = str(e)
                 
                 # --- RETRY CONDITIONS ---
-                # Checks for Cloudflare, Blocks, 403, Network issues, or Title Parsing failure (likely block)
+                # Check for Cloudflare, Blocks, or specific HTTP errors that warrant a retry
+                # REMOVED "IndexError" / "list index out of range" to prevent hang on empty/broken novels
                 if any(x in err_msg for x in ["Cloudflare", "Block", "403", "503", "504", "Connection closed", "Failed to parse novel title"]):
                     wait_time = 60
                     logger.error(f"⚠️ Blocked/Network Error: {url} -> {e}")
@@ -573,6 +574,7 @@ class NovelBot:
                     except: pass
                     
                     await asyncio.sleep(wait_time)
+                    gc.collect()
                     continue # RESTART LOOP (Retry)
 
                 # --- FAILURE CONDITIONS ---

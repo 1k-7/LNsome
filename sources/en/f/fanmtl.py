@@ -71,15 +71,16 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
+        # FIX: Safer pagination logic to prevent "list index out of range"
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if not pagination:
             self.parse_chapter_list(soup)
         else:
-            last_page = pagination[-1]
-            common_url = self.absolute_url(last_page["href"]).split("?")[0]
-            params = parse_qs(urlparse(last_page["href"]).query)
-            
             try:
+                last_page = pagination[-1]
+                common_url = self.absolute_url(last_page["href"]).split("?")[0]
+                params = parse_qs(urlparse(last_page["href"]).query)
+                
                 page_count = int(params.get("page", [0])[0]) + 1
                 wjm = params.get("wjm", [""])[0]
                 
@@ -90,8 +91,9 @@ class FanMTLCrawler(Crawler):
                 
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
-            except Exception:
-                logger.exception("Pagination failed")
+            except Exception as e:
+                # Fallback to single page parsing if pagination math fails
+                logger.error(f"Pagination logic failed: {e}. Falling back to single page.")
                 self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"])
