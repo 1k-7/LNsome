@@ -1,4 +1,4 @@
-# REMOVED: import atexit - This was causing the memory leak
+# REMOVED: import atexit
 import logging
 import os
 from pathlib import Path
@@ -266,7 +266,7 @@ class App:
                     if x["volume"] == vol["id"] and len(x["body"]) > 0
                 ]
         else:
-            # FIX: Check if chapters exist before accessing index 0 to prevent crash
+            # FIX: Check if chapters exist to prevent IndexError
             if not self.chapters:
                 return
 

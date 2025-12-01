@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 4. Copy project files
 COPY . .
+
 # 5. IMPORTANT: Optimization Flags
 # Switch to production to reduce logging/caching overhead
 ENV LNCRAWL_MODE="production"

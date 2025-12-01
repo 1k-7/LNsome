@@ -52,7 +52,10 @@ class TaskManager(ABC):
     def shutdown(self, wait=False):
         if hasattr(self, "_executor"):
             self._submit = None
-            self._executor.shutdown(wait)
+            # FIX: Ensure shutdown actually happens
+            try:
+                self._executor.shutdown(wait)
+            except: pass
         if hasattr(self, "_limiter"):
             self._limiter.shutdown()
 

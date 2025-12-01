@@ -14,12 +14,12 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # 40 threads is a stable maximum for long-running tasks
-        self.init_executor(40)
+        # FIX: Reduced threads from 40 to 8 to prevent RAM usage spike and Cloudflare bans
+        self.init_executor(8)
         self.cleaner.bad_css.update({'div[align="center"]'})
 
         retry = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
 
@@ -28,7 +28,15 @@ class FanMTLCrawler(Crawler):
         soup = self.get_soup(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
-        self.novel_title = possible_title.text.strip() if possible_title else "Unknown Novel"
+        if possible_title:
+            self.novel_title = possible_title.text.strip()
+        else:
+            # FIX: Detect Cloudflare block instead of returning partial info
+            body_text = soup.body.text if soup.body else ""
+            if "Just a moment" in body_text or "Attention Required" in body_text:
+                raise Exception("Cloudflare Blocked Request")
+            
+            self.novel_title = "Unknown Novel"
 
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
@@ -67,7 +75,6 @@ class FanMTLCrawler(Crawler):
                     url = f"{common_url}?page={page}&wjm={wjm}"
                     futures.append(self.executor.submit(self.get_soup, url))
                 
-                # Use a generator to process results as they arrive to save memory
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
             except Exception:
