@@ -31,6 +31,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+# FIX: Reduced from 50 to 8 to prevent RAM exhaustion
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -61,6 +62,7 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
+        # FIX: Reduced max_workers to 2
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
         
         self.userbot = None
@@ -72,7 +74,7 @@ class NovelBot:
         # Lists for skipping bad novels
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set() # Network/Parsing Errors (Max Retries)
+        self.nwerror = set() # Persistent network/parsing errors (Max Retries)
         
         # Topic IDs
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
@@ -83,6 +85,7 @@ class NovelBot:
         self.files = {}
 
     def get_file_path(self, name):
+        """Generates a namespaced file path: data/name_BotUsername.json"""
         return os.path.join(DATA_DIR, f"{name}_{self.bot_username}.json")
 
     def load_data(self):
@@ -93,6 +96,7 @@ class NovelBot:
             try:
                 with open(self.files['processed'], 'r') as f: self.processed = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Processed Failed: {e}")
+        # Legacy check
         elif os.path.exists(os.path.join(DATA_DIR, "processed.json")):
             try:
                 with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
@@ -127,6 +131,8 @@ class NovelBot:
         # --- 6. Load Topics (Critical) ---
         if not self.target_topic_id or not self.error_topic_id:
             loaded = False
+            
+            # A. Check New Specific File
             if os.path.exists(self.files['topics']):
                 try:
                     with open(self.files['topics'], 'r') as f:
@@ -139,6 +145,7 @@ class NovelBot:
                 except Exception as e: 
                     logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
 
+            # B. Check Legacy File (Migration)
             if not loaded:
                 legacy_path = os.path.join(DATA_DIR, "topics.json")
                 if os.path.exists(legacy_path):
@@ -153,6 +160,7 @@ class NovelBot:
                         logger.error(f"❌ CRITICAL: Found legacy topics.json but could not read it: {e}")
 
     def save_topics(self):
+        """Saves current topic IDs to namespaced file"""
         try:
             with open(self.files['topics'], 'w') as f:
                 json.dump({
@@ -167,7 +175,7 @@ class NovelBot:
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
-        # Clean lists
+        # FIX: Remove from bad lists if successful
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         if url in self.nwerror: self.nwerror.remove(url)
@@ -206,10 +214,12 @@ class NovelBot:
         self.save_errors()
         
     async def post_init(self, application: Application):
+        # 1. Identify Self
         me = await application.bot.get_me()
         self.bot_username = me.username
         logger.info(f"🤖 Identity Verified: @{self.bot_username}")
 
+        # 2. Setup Namespaced File Paths
         self.files = {
             'processed': self.get_file_path("processed"),
             'errors': self.get_file_path("errors"),
@@ -220,11 +230,14 @@ class NovelBot:
             'nwerror': self.get_file_path("nwerror")
         }
 
+        # 3. Load Persistent Data
         self.load_data()
 
+        # 4. Auto-Configure Topics
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
             topics_changed = False
             try:
+                # Target Topic
                 if not self.target_topic_id:
                     logger.info("🆕 Creating Target Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -234,6 +247,7 @@ class NovelBot:
                     self.target_topic_id = topic.message_thread_id
                     topics_changed = True
                 
+                # Error Topic
                 if not self.error_topic_id:
                     logger.info("🆕 Creating Error/Log Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -243,6 +257,7 @@ class NovelBot:
                     self.error_topic_id = topic.message_thread_id
                     topics_changed = True
 
+                # Backup Topic
                 if not self.backup_topic_id:
                     logger.info("🆕 Creating Backup Topic...")
                     topic = await application.bot.create_forum_topic(
@@ -252,6 +267,7 @@ class NovelBot:
                     self.backup_topic_id = topic.message_thread_id
                     topics_changed = True
                 
+                # Force save if we created new topics OR if we just migrated
                 if topics_changed or not os.path.exists(self.files['topics']):
                     self.save_topics() 
                 
@@ -260,6 +276,7 @@ class NovelBot:
             except Exception as e:
                 logger.error(f"❌ Failed to configure topics: {e}")
 
+        # 5. Connect Userbot
         if SESSION_STRING and API_ID:
             try:
                 self.userbot = UserBotClient(
@@ -274,11 +291,14 @@ class NovelBot:
             except Exception as e:
                 logger.error(f"❌ Userbot Failed: {e}")
 
+        # 6. Start Background Tasks
         asyncio.create_task(self.backup_loop(application.bot))
 
+        # 7. Resume Pending Queue (With MIGRATION Logic)
         queue_path = self.files['queue']
         legacy_queue_path = os.path.join(DATA_DIR, "queue.json")
 
+        # Check if legacy queue exists and new queue doesn't
         if not os.path.exists(queue_path) and os.path.exists(legacy_queue_path):
             logger.info("♻️ Migrating legacy queue.json to new format...")
             try:
@@ -286,6 +306,7 @@ class NovelBot:
             except Exception as e:
                 logger.error(f"❌ Queue Migration Failed: {e}")
 
+        # Process the queue if it exists
         if os.path.exists(queue_path):
             try:
                 with open(queue_path, 'r') as f: data = json.load(f)
@@ -312,6 +333,7 @@ class NovelBot:
         else:
             logger.info("ℹ️ No pending queue found.")
 
+    # --- HELPER: Send Log ---
     async def send_log(self, bot, text, edit_msg=None):
         if ERROR_GROUP_ID and self.error_topic_id:
             try:
@@ -325,11 +347,12 @@ class NovelBot:
             except: pass 
         return None
 
+    # --- BACKUP SYSTEM ---
     async def backup_loop(self, bot):
-        await asyncio.sleep(60) 
+        await asyncio.sleep(60) # Initial Delay
         while True:
             await self.perform_backup(bot)
-            await asyncio.sleep(86400) 
+            await asyncio.sleep(86400) # 24 Hours
 
     async def perform_backup(self, bot):
         if not ERROR_GROUP_ID or not self.backup_topic_id: return
@@ -339,6 +362,7 @@ class NovelBot:
             zip_name = f"backup_{self.bot_username}_{timestamp}.zip"
             zip_path = os.path.join(DATA_DIR, zip_name)
             
+            # Backup only THIS bot's files
             files_to_backup = [
                 f for f in os.listdir(DATA_DIR) 
                 if f.endswith('.json') 
@@ -374,6 +398,7 @@ class NovelBot:
             logger.error(f"Backup Failed: {e}")
             await self.send_log(bot, f"⚠️ Backup Failed: {e}")
 
+    # --- BOT LOGIC ---
     def start(self):
         print("🚀 Bot Starting...")
         sys.stdout.flush()
@@ -442,8 +467,10 @@ class NovelBot:
             if os.path.exists(temp_path): os.remove(temp_path)
 
     async def process_queue(self, urls, bot):
+        # Clean once before batch starts
         gc.collect()
         
+        # Filter against all lists
         to_process = []
         skipped_null = 0
         skipped_fail = 0
@@ -475,6 +502,7 @@ class NovelBot:
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
         
+        # RETRY LOOP: Keeps trying until success or non-recoverable error
         retry_count = 0
         MAX_RETRIES = 2
         
@@ -483,8 +511,10 @@ class NovelBot:
             loop = asyncio.get_running_loop()
             start_time = time.time()
             
+            # Submit task to executor
             future = loop.run_in_executor(self.executor, self._scrape_logic, url, progress_queue)
             
+            # Monitor progress
             last_text = ""
             last_update = 0
             while not future.done():
@@ -502,6 +532,7 @@ class NovelBot:
                 duration = int(time.time() - start_time)
                 
                 if epub_path and os.path.exists(epub_path):
+                    # --- SUCCESS HANDLER ---
                     file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
                     caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
                     
@@ -543,23 +574,25 @@ class NovelBot:
                             self.save_success(url)
 
                     os.remove(epub_path)
-                    break 
+                    break # Success! Break the retry loop
                 else:
                     self.genfail.add(url)
                     self.save_genfail()
                     await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
-                    break 
+                    break # Logic error (no file), break loop
 
             except Exception as e:
                 err_msg = str(e)
                 
                 # --- CASE 1: 0 Chapters (Strictly checked by fanmtl.py) ---
                 if "No chapters extracted" in err_msg:
+                    # Only add to nullcon if it's explicitly "No chapters extracted"
+                    # This happens when the title was found (so not a block) but the chapter list was empty.
                     self.nullcon.add(url)
                     self.save_nullcon()
                     try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
                     except: pass
-                    break 
+                    break # Stop retrying
 
                 # --- CASE 2: Retry Logic (All other errors including parsing/network) ---
                 else:
@@ -573,7 +606,7 @@ class NovelBot:
                         
                         await asyncio.sleep(wait_time)
                         gc.collect()
-                        continue
+                        continue # RESTART LOOP (Retry)
                     else:
                         # --- CASE 3: Max Retries Exceeded -> nwerror ---
                         logger.error(f"❌ Max Retries Exceeded: {url} -> {e}")
@@ -581,7 +614,7 @@ class NovelBot:
                         self.save_nwerror()
                         try: await self.send_log(bot, f"❌ Max Retries Exceeded: {url} (Added to nwerror)", edit_msg=status_msg)
                         except: pass
-                        break
+                        break # Stop retrying
 
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
@@ -625,6 +658,7 @@ class NovelBot:
 
             progress_queue.put("📦 Binding...")
             
+            # FIX: Catch IndexError inside worker
             try:
                 for fmt, f in app.bind_books(): return f
             except IndexError:

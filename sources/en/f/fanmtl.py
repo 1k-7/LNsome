@@ -14,6 +14,7 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
+        # FIX: Reduced threads from 40 to 8 to prevent RAM usage spike and Cloudflare bans
         self.init_executor(8)
         self.cleaner.bad_css.update({'div[align="center"]'})
 
@@ -26,7 +27,7 @@ class FanMTLCrawler(Crawler):
         logger.debug("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
-        # 1. Cloudflare/Block Check
+        # 1. Cloudflare/Block Detection
         body_text = soup.body.text.lower() if soup.body else ""
         block_keywords = [
             "just a moment", "attention required", "verify you are human", 
@@ -35,33 +36,35 @@ class FanMTLCrawler(Crawler):
         if any(keyword in body_text for keyword in block_keywords):
             raise Exception("Cloudflare Blocked Request")
 
-        # 2. Title Check
+        # 2. Title Detection
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
+            # If no title found, it's likely a broken page or a block.
             raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
-        # 3. PRECISE ZERO-CHAPTER CHECK (Based on User HTML)
-        # Structure: <strong><i class="..."></i> No</strong> <small>Chapters</small>
-        # We look for <small> tags containing "Chapters" and check their predecessor.
+        # 3. PRECISE ZERO-CHAPTER CHECK
+        # User structure: <span><strong><i class="..."></i> No</strong><small>Chapters</small></span>
+        # logic: Find <small> with "Chapters" -> Check if previous sibling is <strong> with "No"
         is_zero_chapter = False
-        
-        for small_tag in soup.select("small"):
-            if "Chapters" in small_tag.get_text(strip=True):
-                # Check previous sibling element (ignoring whitespace/text nodes)
-                prev = small_tag.find_previous_sibling()
-                if prev and prev.name == "strong" and "No" in prev.get_text(strip=True):
+        for small in soup.select("small"):
+            if "Chapters" in small.get_text(strip=True):
+                # find_previous_sibling("strong") skips whitespace/newlines to find the tag
+                prev = small.find_previous_sibling("strong")
+                if prev and "No" in prev.get_text(strip=True):
                     is_zero_chapter = True
                     break
         
         if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
-            logger.info("Novel has 'No Chapters' indicator. Returning empty list.")
-            return # <--- CRITICAL: Exit immediately to prevent pagination crash.
+            logger.info("Verified 0-chapter novel (No Chapters tag found).")
+            # CRITICAL: Return immediately. This results in empty chapters list 
+            # without running pagination logic that might crash.
+            return 
 
-        # 4. Standard Metadata
+        # 4. Standard Metadata Extraction
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
             url = img_tag.get("src")
@@ -83,12 +86,13 @@ class FanMTLCrawler(Crawler):
         self.chapters = []
         
         # 5. Pagination & Chapter Parsing
-        # Only runs if 'No Chapters' indicator was NOT found.
+        # NO try/except here. If this crashes (IndexError), it means the layout is broken/unexpected
+        # AND it is NOT a verified 0-chapter novel. The crash will bubble up to bot.py
+        # which will retry 2 times and then save to nwerror.
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if not pagination:
             self.parse_chapter_list(soup)
         else:
-            # If this crashes now, it is a legitimate scraping error (retryable), NOT a zero-chapter case.
             last_page = pagination[-1]
             common_url = self.absolute_url(last_page["href"]).split("?")[0]
             params = parse_qs(urlparse(last_page["href"]).query)
@@ -106,8 +110,10 @@ class FanMTLCrawler(Crawler):
 
         self.chapters.sort(key=lambda x: x["id"])
 
-        # Final Verification: If we have 0 chapters but didn't find the 'No Chapters' tag, it's a parsing error.
+        # Final Verification
         if not self.chapters:
+             # If we get here, the list is empty BUT we didn't find the "No Chapters" tag earlier.
+             # This is a parsing failure. Raise Exception to trigger retry.
              raise Exception("Parsing Error: Chapter list empty but 'No Chapters' indicator missing")
 
     def parse_chapter_list(self, soup):
