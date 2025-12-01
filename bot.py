@@ -563,36 +563,29 @@ class NovelBot:
             except Exception as e:
                 err_msg = str(e)
                 
-                # --- RETRY CONDITIONS ---
-                # Check for Cloudflare, Blocks, or specific HTTP errors that warrant a retry
-                # REMOVED "IndexError" / "list index out of range" to prevent spam loops on broken novels
-                if any(x in err_msg for x in ["Cloudflare", "Block", "403", "503", "504", "Connection closed", "Failed to parse novel title"]):
-                    wait_time = 60
-                    logger.error(f"⚠️ Blocked/Network Error: {url} -> {e}")
-                    try: 
-                        await self.send_log(bot, f"⚠️ **Blocked/Network Error:** {e}\n♻️ Retrying in {wait_time}s...", edit_msg=status_msg)
-                    except: pass
-                    
-                    await asyncio.sleep(wait_time)
-                    gc.collect()
-                    continue # RESTART LOOP (Retry)
-
-                # --- FAILURE CONDITIONS ---
-                elif "No chapters extracted" in err_msg:
-                    # STRICTLY only add to nullcon if it's explicitly "No chapters extracted"
-                    # This happens when fanmtl.py returns 0 chapters (swallows the crash).
+                # --- STRICT NULLCON CHECK ---
+                # Only add if specifically "No chapters extracted".
+                # This ensures fanmtl.py confirmed the "No Chapters" text.
+                if "No chapters extracted" in err_msg:
                     self.nullcon.add(url)
                     self.save_nullcon()
                     try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
                     except: pass
                     break # Stop retrying
 
+                # --- RETRY EVERYTHING ELSE ---
+                # Includes Cloudflare, IndexError, Parsing Mismatch, etc.
                 else:
-                    logger.error(f"Fail: {url} -> {e}")
-                    try: await self.send_log(bot, f"❌ Error: {e}", edit_msg=status_msg)
+                    wait_time = 60
+                    logger.error(f"❌ Error (Retrying): {url} -> {e}")
+                    try: 
+                        # Log error as requested before retrying
+                        await self.send_log(bot, f"❌ Error: {e}\n{url}\n♻️ Retrying in {wait_time}s...", edit_msg=status_msg)
                     except: pass
-                    self.save_error(url, str(e))
-                    break # Stop retrying
+                    
+                    await asyncio.sleep(wait_time)
+                    gc.collect()
+                    continue # RESTART LOOP (Retry)
 
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
