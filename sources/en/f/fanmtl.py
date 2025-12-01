@@ -18,7 +18,7 @@ class FanMTLCrawler(Crawler):
         self.init_executor(8)
         self.cleaner.bad_css.update({'div[align="center"]'})
 
-        retry = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
@@ -31,12 +31,25 @@ class FanMTLCrawler(Crawler):
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
-            # FIX: Detect Cloudflare block instead of returning partial info
-            body_text = soup.body.text if soup.body else ""
-            if "Just a moment" in body_text or "Attention Required" in body_text:
+            # FIX: Robust Cloudflare/Block Detection
+            # If we can't find the title, check if it's a specific block page.
+            body_text = soup.body.text.lower() if soup.body else ""
+            block_keywords = [
+                "just a moment", 
+                "attention required", 
+                "verify you are human", 
+                "security check", 
+                "ray id", 
+                "enable javascript"
+            ]
+            
+            if any(keyword in body_text for keyword in block_keywords):
                 raise Exception("Cloudflare Blocked Request")
             
-            self.novel_title = "Unknown Novel"
+            # CRITICAL: If no title is found and it's not a known block, we still raise an exception.
+            # We DO NOT return "Unknown Novel", because that would make the bot think 
+            # it is a valid novel with 0 chapters and add it to nullcon.
+            raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:

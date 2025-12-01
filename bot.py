@@ -484,92 +484,113 @@ class NovelBot:
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
         
-        progress_queue = queue.Queue()
-        loop = asyncio.get_running_loop()
-        start_time = time.time()
-        
-        future = loop.run_in_executor(self.executor, self._scrape_logic, url, progress_queue)
-        
-        last_text = ""
-        last_update = 0
-        while not future.done():
-            try:
-                text = progress_queue.get_nowait()
-                if text != last_text and (time.time() - last_update) > 5:
-                    try: 
-                        await self.send_log(bot, text, edit_msg=status_msg)
-                        last_text = text; last_update = time.time()
-                    except: pass
-            except queue.Empty: await asyncio.sleep(0.5)
-
-        try:
-            epub_path = await future
-            duration = int(time.time() - start_time)
+        # RETRY LOOP: Keeps trying until success or non-recoverable error
+        while True:
+            progress_queue = queue.Queue()
+            loop = asyncio.get_running_loop()
+            start_time = time.time()
             
-            if epub_path and os.path.exists(epub_path):
-                file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
-                caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
+            # Submit task to executor
+            future = loop.run_in_executor(self.executor, self._scrape_logic, url, progress_queue)
+            
+            # Monitor progress
+            last_text = ""
+            last_update = 0
+            while not future.done():
+                try:
+                    text = progress_queue.get_nowait()
+                    if text != last_text and (time.time() - last_update) > 5:
+                        try: 
+                            await self.send_log(bot, text, edit_msg=status_msg)
+                            last_text = text; last_update = time.time()
+                        except: pass
+                except queue.Empty: await asyncio.sleep(0.5)
+
+            try:
+                epub_path = await future
+                duration = int(time.time() - start_time)
                 
-                try: await status_msg.delete()
-                except: pass
+                if epub_path and os.path.exists(epub_path):
+                    # --- SUCCESS HANDLER ---
+                    file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
+                    caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
+                    
+                    try: await status_msg.delete()
+                    except: pass
 
-                dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
-                dest_topic_id = self.target_topic_id
+                    dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
+                    dest_topic_id = self.target_topic_id
 
-                if not dest_chat_id or not dest_topic_id:
-                     await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
-                     return
+                    if not dest_chat_id or not dest_topic_id:
+                        await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
+                        return
 
-                if file_size_mb > USERBOT_THRESHOLD and self.userbot:
-                    prog_msg = await self.send_log(bot, f"⚠️ File is {file_size_mb:.1f}MB (> {USERBOT_THRESHOLD}MB)\n🚀 Uploading via Userbot...")
-                    try:
-                        await self.userbot.send_document(
-                            chat_id=int(dest_chat_id),
-                            document=epub_path,
-                            caption=caption,
-                            message_thread_id=dest_topic_id
-                        )
-                        await prog_msg.delete()
-                        self.save_success(url)
-                    except Exception as e:
-                        await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
-                else:
-                    if file_size_mb >= 50:
-                         await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
-                         self.save_error(url, "File > 50MB & No Userbot")
-                    else:
-                        with open(epub_path, 'rb') as f:
-                            await bot.send_document(
-                                chat_id=dest_chat_id,
-                                message_thread_id=dest_topic_id,
-                                document=f,
-                                caption=caption
+                    if file_size_mb > USERBOT_THRESHOLD and self.userbot:
+                        prog_msg = await self.send_log(bot, f"⚠️ File is {file_size_mb:.1f}MB (> {USERBOT_THRESHOLD}MB)\n🚀 Uploading via Userbot...")
+                        try:
+                            await self.userbot.send_document(
+                                chat_id=int(dest_chat_id),
+                                document=epub_path,
+                                caption=caption,
+                                message_thread_id=dest_topic_id
                             )
-                        self.save_success(url)
+                            await prog_msg.delete()
+                            self.save_success(url)
+                        except Exception as e:
+                            await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
+                    else:
+                        if file_size_mb >= 50:
+                            await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
+                            self.save_error(url, "File > 50MB & No Userbot")
+                        else:
+                            with open(epub_path, 'rb') as f:
+                                await bot.send_document(
+                                    chat_id=dest_chat_id,
+                                    message_thread_id=dest_topic_id,
+                                    document=f,
+                                    caption=caption
+                                )
+                            self.save_success(url)
 
-                os.remove(epub_path)
-            else:
-                self.genfail.add(url)
-                self.save_genfail()
-                await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
-        except Exception as e:
-            err_msg = str(e)
-            # FIX: Detect Cloudflare Block -> Log only, DO NOT skip
-            if "Cloudflare" in err_msg or "Block" in err_msg:
-                 logger.error(f"⚠️ Blocked: {url} -> {e}")
-                 try: await self.send_log(bot, f"❌ Blocked by Cloudflare: {url}", edit_msg=status_msg)
-                 except: pass
-            # FIX: Detect valid "No chapters" or Index Error -> Add to nullcon
-            elif "No chapters extracted" in err_msg or "IndexError" in err_msg or "list index out of range" in err_msg:
-                self.nullcon.add(url)
-                self.save_nullcon()
-                try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
-                except: pass
-            else:
-                logger.error(f"Fail: {url} -> {e}")
-                try: await self.send_log(bot, f"❌ Error: {e}", edit_msg=status_msg)
-                except: pass
-                self.save_error(url, str(e))
+                    os.remove(epub_path)
+                    break # Success! Break the retry loop
+                else:
+                    self.genfail.add(url)
+                    self.save_genfail()
+                    await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
+                    break # Logic error (no file), break loop
+
+            except Exception as e:
+                err_msg = str(e)
+                
+                # --- RETRY CONDITIONS ---
+                # Checks for Cloudflare, Blocks, 403, Network issues, or Title Parsing failure (likely block)
+                if any(x in err_msg for x in ["Cloudflare", "Block", "403", "503", "504", "Connection closed", "Failed to parse novel title"]):
+                    wait_time = 60
+                    logger.error(f"⚠️ Blocked/Network Error: {url} -> {e}")
+                    try: 
+                        await self.send_log(bot, f"⚠️ **Blocked/Network Error:** {e}\n♻️ Retrying in {wait_time}s...", edit_msg=status_msg)
+                    except: pass
+                    
+                    await asyncio.sleep(wait_time)
+                    continue # RESTART LOOP (Retry)
+
+                # --- FAILURE CONDITIONS ---
+                elif "No chapters extracted" in err_msg:
+                    # STRICTLY only add to nullcon if it's explicitly "No chapters extracted"
+                    # This happens when the title was found (so not a block) but the chapter list was empty.
+                    self.nullcon.add(url)
+                    self.save_nullcon()
+                    try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
+                    except: pass
+                    break # Stop retrying
+
+                else:
+                    logger.error(f"Fail: {url} -> {e}")
+                    try: await self.send_log(bot, f"❌ Error: {e}", edit_msg=status_msg)
+                    except: pass
+                    self.save_error(url, str(e))
+                    break # Stop retrying
 
     def _scrape_logic(self, url: str, progress_queue):
         app = App()
