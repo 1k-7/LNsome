@@ -32,8 +32,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Preserving your requested thread count
-THREADS_PER_NOVEL = 8
+THREADS_PER_NOVEL = 8  # Set to 8 as requested
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -61,11 +60,10 @@ logger = logging.getLogger(__name__)
 
 pending_uploads = {}
 
-# --- WORKER FUNCTION (Must be global for ProcessPoolExecutor) ---
+# --- WORKER FUNCTION (Must be global for Multiprocessing) ---
 def scrape_logic_worker(url, progress_queue):
     """
-    Runs the scraping logic in a separate process.
-    Communicates progress back via the multiprocessing Queue.
+    Runs the scraping logic in a separate process to avoid GIL and memory issues.
     """
     # Reload sources in the new process context
     load_sources()
@@ -78,10 +76,10 @@ def scrape_logic_worker(url, progress_queue):
         app.prepare_search()
         app.get_novel_info()
         
-        # Initialize crawler threads inside the process
         if app.crawler: 
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
+        # Fetch Cover Image
         if app.crawler.novel_cover:
             try:
                 headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
@@ -106,6 +104,7 @@ def scrape_logic_worker(url, progress_queue):
             if i % 50 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
+        # Fix empty chapters
         failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
         if failed:
             if progress_queue: progress_queue.put(f"⚠️ Fixing {len(failed)} chapters...")
@@ -118,7 +117,7 @@ def scrape_logic_worker(url, progress_queue):
         try:
             for fmt, f in app.bind_books(): return f
         except IndexError:
-             raise Exception("No chapters extracted (IndexError during binding)")
+             raise Exception("IndexError during binding")
         return None
 
     except Exception as e:
@@ -129,106 +128,52 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # PROCESS POOL: Max 2 processes to save memory while keeping 8 threads per crawler inside the process
+        # Use ProcessPoolExecutor for CPU bound tasks
         self.executor = ProcessPoolExecutor(max_workers=2)
         self.manager = multiprocessing.Manager()
         
         self.userbot = None
         self.bot_username = None 
         
-        # State
-        self.processed = set()
-        self.errors = {}
-        # Lists for skipping bad novels
-        self.nullcon = set()
-        self.genfail = set()
-        self.nwerror = set() # Persistent network/parsing errors
+        # Permanent lists
+        self.nullcon = set() # 0 Chapters / Index Errors
+        self.genfail = set() # Generation Failed (No file)
         
-        # Topic IDs
+        # Session list (clears on restart)
+        self.processed_session = set()
+        
+        # Topics
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
         self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
         self.backup_topic_id = None
 
-        # File Paths (Set in post_init)
         self.files = {}
 
     def get_file_path(self, name):
-        """Generates a namespaced file path: data/name_BotUsername.json"""
+        """Generates a namespaced file path"""
         return os.path.join(DATA_DIR, f"{name}_{self.bot_username}.json")
 
     def load_data(self):
-        """Loads data with verbose error logging and migration support"""
-        
-        # --- 1. Load Processed Novels ---
-        if os.path.exists(self.files['processed']):
-            try:
-                with open(self.files['processed'], 'r') as f: self.processed = set(json.load(f))
-            except Exception as e: logger.error(f"⚠️ Load Processed Failed: {e}")
-        # Legacy check
-        elif os.path.exists(os.path.join(DATA_DIR, "processed.json")):
-            try:
-                with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
-                    self.processed = set(json.load(f))
-                logger.info("♻️ Migrated processed.json")
-            except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
+        """Loads persistent data"""
+        # Load Nullcon and Genfail
+        for key in ['nullcon', 'genfail']:
+            if os.path.exists(self.files[key]):
+                try:
+                    with open(self.files[key], 'r') as f: setattr(self, key, set(json.load(f)))
+                except: pass
 
-        # --- 2. Load Errors ---
-        if os.path.exists(self.files['errors']):
-            try:
-                with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
-            except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
-
-        # --- 3. Load Null Content (0 Chapters) ---
-        if os.path.exists(self.files['nullcon']):
-            try:
-                with open(self.files['nullcon'], 'r') as f: self.nullcon = set(json.load(f))
-            except Exception as e: logger.error(f"⚠️ Load Nullcon Failed: {e}")
-
-        # --- 4. Load Genfail (Generation Failed) ---
-        if os.path.exists(self.files['genfail']):
-            try:
-                with open(self.files['genfail'], 'r') as f: self.genfail = set(json.load(f))
-            except Exception as e: logger.error(f"⚠️ Load Genfail Failed: {e}")
-
-        # --- 5. Load nwerror (Max Retry Failures) ---
-        if os.path.exists(self.files['nwerror']):
-            try:
-                with open(self.files['nwerror'], 'r') as f: self.nwerror = set(json.load(f))
-            except Exception as e: logger.error(f"⚠️ Load nwerror Failed: {e}")
-
-        # --- 6. Load Topics (Critical) ---
+        # Load Topics
         if not self.target_topic_id or not self.error_topic_id:
-            loaded = False
-            
-            # A. Check New Specific File
             if os.path.exists(self.files['topics']):
                 try:
                     with open(self.files['topics'], 'r') as f:
                         data = json.load(f)
-                        if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
-                        if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
-                        self.backup_topic_id = data.get("backup_topic_id")
-                        loaded = True
-                        logger.info(f"✅ Loaded Topics from {os.path.basename(self.files['topics'])}")
-                except Exception as e: 
-                    logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
-
-            # B. Check Legacy File (Migration)
-            if not loaded:
-                legacy_path = os.path.join(DATA_DIR, "topics.json")
-                if os.path.exists(legacy_path):
-                    try:
-                        with open(legacy_path, 'r') as f:
-                            data = json.load(f)
-                            if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
-                            if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
-                            self.backup_topic_id = data.get("backup_topic_id")
-                            logger.info(f"♻️ Migrated Topics from legacy topics.json")
-                    except Exception as e: 
-                        logger.error(f"❌ CRITICAL: Found legacy topics.json but could not read it: {e}")
+                        self.target_topic_id = data.get("target_topic_id", self.target_topic_id)
+                        self.error_topic_id = data.get("error_topic_id", self.error_topic_id)
+                        self.backup_topic_id = data.get("backup_topic_id", self.backup_topic_id)
+                except: pass
 
     def save_topics(self):
-        """Saves current topic IDs to namespaced file"""
         try:
             with open(self.files['topics'], 'w') as f:
                 json.dump({
@@ -236,115 +181,62 @@ class NovelBot:
                     "error_topic_id": self.error_topic_id,
                     "backup_topic_id": self.backup_topic_id
                 }, f, indent=2)
-            logger.info(f"💾 Topics Saved to {os.path.basename(self.files['topics'])}")
-        except Exception as e:
-            logger.error(f"❌ Could not save topics: {e}")
+        except: pass
+
+    def save_list(self, key):
+        try:
+            data = list(getattr(self, key))
+            with open(self.files[key], 'w') as f: json.dump(data, f, indent=2)
+        except: pass
 
     def save_success(self, url):
-        self.processed.add(url)
-        if url in self.errors: del self.errors[url]
-        # FIX: Remove from bad lists if successful
-        if url in self.nullcon: self.nullcon.remove(url)
-        if url in self.genfail: self.genfail.remove(url)
-        if url in self.nwerror: self.nwerror.remove(url)
-
-        try:
-            with open(self.files['processed'], 'w') as f: 
-                json.dump(list(self.processed), f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save Success Failed: {e}")
-
-    def save_errors(self):
-        try:
-            with open(self.files['errors'], 'w') as f: 
-                json.dump(self.errors, f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save Errors Failed: {e}")
-
-    def save_nullcon(self):
-        try:
-            with open(self.files['nullcon'], 'w') as f: 
-                json.dump(list(self.nullcon), f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save Nullcon Failed: {e}")
-
-    def save_genfail(self):
-        try:
-            with open(self.files['genfail'], 'w') as f: 
-                json.dump(list(self.genfail), f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save Genfail Failed: {e}")
-
-    def save_nwerror(self):
-        try:
-            with open(self.files['nwerror'], 'w') as f: 
-                json.dump(list(self.nwerror), f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save nwerror Failed: {e}")
-
-    def save_error(self, url, error_msg):
-        self.errors[url] = str(error_msg)
-        self.save_errors()
+        # Mark processed in current session only
+        self.processed_session.add(url)
+        
+        # Remove from bad lists if it succeeded this time
+        if url in self.genfail:
+            self.genfail.remove(url)
+            self.save_list('genfail')
+        if url in self.nullcon:
+            self.nullcon.remove(url)
+            self.save_list('nullcon')
         
     async def post_init(self, application: Application):
-        # 1. Identify Self
         me = await application.bot.get_me()
         self.bot_username = me.username
         logger.info(f"🤖 Identity Verified: @{self.bot_username}")
 
-        # 2. Setup Namespaced File Paths
+        # Define file paths
         self.files = {
-            'processed': self.get_file_path("processed"),
-            'errors': self.get_file_path("errors"),
             'queue': self.get_file_path("queue"),
             'topics': self.get_file_path("topics"),
-            'nullcon': self.get_file_path("nullcon"),
             'genfail': self.get_file_path("genfail"),
-            'nwerror': self.get_file_path("nwerror")
+            'nullcon': self.get_file_path("nullcon")
         }
 
-        # 3. Load Persistent Data
         self.load_data()
 
-        # 4. Auto-Configure Topics
+        # Auto-Configure Topics
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
-            topics_changed = False
             try:
-                # Target Topic
                 if not self.target_topic_id:
-                    logger.info("🆕 Creating Target Topic...")
-                    topic = await application.bot.create_forum_topic(
-                        chat_id=TARGET_GROUP_ID, 
-                        name=f"📚 {self.bot_username} Novels"
-                    )
+                    topic = await application.bot.create_forum_topic(chat_id=TARGET_GROUP_ID, name=f"📚 {self.bot_username} Novels")
                     self.target_topic_id = topic.message_thread_id
-                    topics_changed = True
+                    self.save_topics()
                 
-                # Error Topic
                 if not self.error_topic_id:
-                    logger.info("🆕 Creating Error/Log Topic...")
-                    topic = await application.bot.create_forum_topic(
-                        chat_id=ERROR_GROUP_ID, 
-                        name=f"🛠 {self.bot_username} Logs"
-                    )
+                    topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🛠 {self.bot_username} Logs")
                     self.error_topic_id = topic.message_thread_id
-                    topics_changed = True
+                    self.save_topics()
 
-                # Backup Topic
                 if not self.backup_topic_id:
-                    logger.info("🆕 Creating Backup Topic...")
-                    topic = await application.bot.create_forum_topic(
-                        chat_id=ERROR_GROUP_ID, 
-                        name=f"🗄️ {self.bot_username} Backup"
-                    )
+                    topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🗄️ {self.bot_username} Backup")
                     self.backup_topic_id = topic.message_thread_id
-                    topics_changed = True
-                
-                # Force save if we created new topics OR if we just migrated
-                if topics_changed or not os.path.exists(self.files['topics']):
-                    self.save_topics() 
-                
-                logger.info(f"🎯 Configuration: Target={self.target_topic_id} | Logs={self.error_topic_id}")
-
+                    self.save_topics()
             except Exception as e:
-                logger.error(f"❌ Failed to configure topics: {e}")
+                logger.error(f"Failed to configure topics: {e}")
 
-        # 5. Connect Userbot
+        # Userbot Connection
         if SESSION_STRING and API_ID:
             try:
                 self.userbot = UserBotClient(
@@ -359,49 +251,28 @@ class NovelBot:
             except Exception as e:
                 logger.error(f"❌ Userbot Failed: {e}")
 
-        # 6. Start Background Tasks
+        # Start Background Tasks
         asyncio.create_task(self.backup_loop(application.bot))
 
-        # 7. Resume Pending Queue (With MIGRATION Logic)
-        queue_path = self.files['queue']
-        legacy_queue_path = os.path.join(DATA_DIR, "queue.json")
-
-        # Check if legacy queue exists and new queue doesn't
-        if not os.path.exists(queue_path) and os.path.exists(legacy_queue_path):
-            logger.info("♻️ Migrating legacy queue.json to new format...")
+        # Resume Queue
+        if os.path.exists(self.files['queue']):
             try:
-                shutil.move(legacy_queue_path, queue_path)
-            except Exception as e:
-                logger.error(f"❌ Queue Migration Failed: {e}")
-
-        # Process the queue if it exists
-        if os.path.exists(queue_path):
-            try:
-                with open(queue_path, 'r') as f: data = json.load(f)
+                with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
-                # FIX: Filter pending against all lists including nwerror
-                pending = [
-                    u for u in urls 
-                    if u not in self.processed 
-                    and u not in self.nullcon 
-                    and u not in self.genfail
-                    and u not in self.nwerror
-                ]
+                # Resume novels that are not in permanent fail lists
+                resume_urls = [u for u in urls if u not in self.nullcon and u not in self.genfail]
                 
-                if pending:
-                    msg = f"🔄 **Restarted**\nResuming {len(pending)} novels..."
-                    await self.send_log(application.bot, msg)
-                    asyncio.create_task(self.process_queue(urls, application.bot))
+                if resume_urls:
+                    await self.send_log(application.bot, f"🔄 **Restarted**\nResuming {len(resume_urls)} novels...")
+                    asyncio.create_task(self.process_queue(resume_urls, application.bot))
                 else:
-                    logger.info("✅ Queue file found but all novels processed. Cleaning up.")
-                    os.remove(queue_path)
+                    # If queue exists but all are nullcon/genfail, clear it
+                    if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
+                    
             except Exception as e:
-                logger.error(f"❌ Error processing queue file: {e}")
-        else:
-            logger.info("ℹ️ No pending queue found.")
+                logger.error(f"Error processing queue file: {e}")
 
-    # --- HELPER: Send Log ---
     async def send_log(self, bot, text, edit_msg=None):
         if ERROR_GROUP_ID and self.error_topic_id:
             try:
@@ -415,7 +286,6 @@ class NovelBot:
             except: pass 
         return None
 
-    # --- BACKUP SYSTEM ---
     async def backup_loop(self, bot):
         await asyncio.sleep(60) # Initial Delay
         while True:
@@ -430,7 +300,6 @@ class NovelBot:
             zip_name = f"backup_{self.bot_username}_{timestamp}.zip"
             zip_path = os.path.join(DATA_DIR, zip_name)
             
-            # Backup only THIS bot's files
             files_to_backup = [
                 f for f in os.listdir(DATA_DIR) 
                 if f.endswith('.json') 
@@ -445,11 +314,7 @@ class NovelBot:
                     full_path = os.path.join(DATA_DIR, file_name)
                     zf.write(full_path, file_name)
             
-            caption = (
-                f"🗄️ **Daily Backup**\n"
-                f"📅 {timestamp}\n"
-                f"📂 Files: {len(files_to_backup)}"
-            )
+            caption = f"🗄️ **Daily Backup**\n📅 {timestamp}\n📂 Files: {len(files_to_backup)}"
 
             with open(zip_path, 'rb') as f:
                 await bot.send_document(
@@ -460,13 +325,10 @@ class NovelBot:
                 )
             
             if os.path.exists(zip_path): os.remove(zip_path)
-            logger.info("✅ Backup uploaded successfully")
             
         except Exception as e:
             logger.error(f"Backup Failed: {e}")
-            await self.send_log(bot, f"⚠️ Backup Failed: {e}")
 
-    # --- BOT LOGIC ---
     def start(self):
         print("🚀 Bot Starting...")
         sys.stdout.flush()
@@ -491,19 +353,17 @@ class NovelBot:
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
+        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nUser: {self.bot_username}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.processed = set()
+        self.processed_session = set()
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set()
-        if os.path.exists(self.files['processed']): os.remove(self.files['processed'])
-        if os.path.exists(self.files['nullcon']): os.remove(self.files['nullcon'])
-        if os.path.exists(self.files['genfail']): os.remove(self.files['genfail'])
-        if os.path.exists(self.files['nwerror']): os.remove(self.files['nwerror'])
-        if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
-        await update.message.reply_text("🗑️ History Reset (Processed, Nullcon, Genfail, Nwerror).")
+        
+        for f in [self.files['nullcon'], self.files['genfail'], self.files['queue']]:
+            if os.path.exists(f): os.remove(f)
+            
+        await update.message.reply_text("🗑️ Reset Complete (Nullcon, Genfail, Queue).")
 
     async def cmd_force_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Starting manual backup...")
@@ -535,34 +395,34 @@ class NovelBot:
             if os.path.exists(temp_path): os.remove(temp_path)
 
     async def process_queue(self, urls, bot):
-        # Clean once before batch starts
+        # Free up memory before batch
         gc.collect()
         
-        # Filter against all lists
         to_process = []
-        skipped_null = 0
-        skipped_fail = 0
+        skipped_count = 0
         
         for u in urls:
-            if u in self.processed: continue
-            if u in self.nullcon: 
-                skipped_null += 1
+            # Skip permanent failures
+            if u in self.nullcon or u in self.genfail:
+                skipped_count += 1
                 continue
-            if u in self.genfail or u in self.nwerror:
-                skipped_fail += 1
+            # Skip session processed
+            if u in self.processed_session:
                 continue
+                
             to_process.append(u)
 
         if not to_process:
             if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
-            await self.send_log(bot, f"✅ **Queue Complete**\n(Skipped: {skipped_null} null, {skipped_fail} failed/error)")
+            await self.send_log(bot, f"✅ **Queue Complete**\n(Skipped: {skipped_count} previously failed/null)")
             return
 
-        await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped_null} null, {skipped_fail} failed/error)")
+        await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped_count})")
         
         for url in to_process:
-            if url in self.processed: continue
+            if url in self.processed_session: continue
             await self.process_novel(url, bot)
+            gc.collect()
         
         await self.send_log(bot, "✅ **All Tasks Finished**")
         if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
@@ -570,20 +430,18 @@ class NovelBot:
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
         
-        # NO RETRY LOOP. ONE SHOT.
-        
-        # Queue for communicating with the process
+        # Manager Queue for multiprocessing logging
         progress_queue = self.manager.Queue()
         loop = asyncio.get_running_loop()
         start_time = time.time()
         
-        # Submit task to process pool
+        # Run scraping in separate process
         future = loop.run_in_executor(self.executor, scrape_logic_worker, url, progress_queue)
         
-        # Monitor progress
         last_text = ""
         last_update = 0
         
+        # Monitor Loop
         while not future.done():
             try:
                 try:
@@ -593,16 +451,19 @@ class NovelBot:
                             await self.send_log(bot, text, edit_msg=status_msg)
                             last_text = text; last_update = time.time()
                         except: pass
-                except queue.Empty: pass
-                await asyncio.sleep(1)
-            except: await asyncio.sleep(1)
+                except queue.Empty:
+                    pass
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            except: await asyncio.sleep(0.5)
 
         try:
             epub_path = await future
             duration = int(time.time() - start_time)
             
             if epub_path and os.path.exists(epub_path):
-                # --- SUCCESS HANDLER ---
+                # --- SUCCESS ---
                 file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
                 caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
                 
@@ -632,7 +493,7 @@ class NovelBot:
                 else:
                     if file_size_mb >= 50:
                         await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
-                        self.save_error(url, "File > 50MB & No Userbot")
+                        # Don't save to error lists, allow retry on restart with Userbot config
                     else:
                         with open(epub_path, 'rb') as f:
                             await bot.send_document(
@@ -644,32 +505,28 @@ class NovelBot:
                         self.save_success(url)
 
                 os.remove(epub_path)
-                
             else:
-                # Generation failed but no exception raised? 
+                # --- GENFAIL (Logic failure) ---
                 self.genfail.add(url)
-                self.save_genfail()
+                self.save_list('genfail')
                 await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
 
         except Exception as e:
             err_msg = str(e)
             
-            # --- CRITICAL FIX: Treat IndexError as NULL CONTENT and STOP ---
+            # --- NULLCON (IndexError / Empty) ---
             if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
                 self.nullcon.add(url)
-                self.save_nullcon()
+                self.save_list('nullcon')
                 try: await self.send_log(bot, f"⚠️ {url}: Null Content/Index Error (Added to nullcon)", edit_msg=status_msg)
                 except: pass
-                # NO RETRY
             
-            # --- ALL OTHER ERRORS: Treat as NWERROR and STOP (As per instructions) ---
+            # --- NETWORK/OTHER ERROR ---
+            # Do NOT save to any list. Just log. Will be retried next time bot restarts.
             else:
-                logger.error(f"❌ Max Retries Exceeded (Instant): {url} -> {e}")
-                self.nwerror.add(url)
-                self.save_nwerror()
-                try: await self.send_log(bot, f"❌ Error: {e} (Added to nwerror)", edit_msg=status_msg)
+                logger.error(f"Unsaved Error: {url} -> {e}")
+                try: await self.send_log(bot, f"❌ Error: {e}\n{url} (Not Saved)", edit_msg=status_msg)
                 except: pass
-                # NO RETRY
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
