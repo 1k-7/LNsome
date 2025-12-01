@@ -62,9 +62,7 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # 3. Chapter Parsing (NO TRY/EXCEPT)
-        # If this crashes (IndexError), it raises an Exception to the bot.
-        # The bot will then Log it and Retry it.
+        # 3. Chapter Parsing (No Try/Except - Let it crash if layout breaks)
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if not pagination:
             self.parse_chapter_list(soup)
@@ -87,16 +85,15 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"])
 
         # 4. STRICT 0-CHAPTER VALIDATION
-        # If chapters list is empty, we MUST verify "No Chapters" text exists.
         if not self.chapters:
-            # Check entire page text for "No Chapters" (case insensitive)
-            if "no chapters" in soup.text.lower():
-                # Valid 0-chapter novel. Returns empty list.
-                # lncrawl will raise "No chapters extracted", which bot sends to nullcon.
-                pass 
+            # FIX: Normalize text to handle split tags like <strong>No</strong> <small>Chapters</small>
+            # soup.get_text(" ", strip=True) turns that into "No Chapters"
+            full_text = soup.get_text(" ", strip=True).lower()
+            
+            if "no chapters" in full_text:
+                pass # Verified 0-chapter novel. Returns empty list -> saved to nullcon.
             else:
-                # Empty list but missing confirmation text -> Likely a parsing error/glitch.
-                # Raise Exception to trigger Retry in bot.
+                # If "No Chapters" isn't found, it's a layout error or block.
                 raise Exception("Parsing Error: Chapter list empty but 'No Chapters' text missing")
 
     def parse_chapter_list(self, soup):
