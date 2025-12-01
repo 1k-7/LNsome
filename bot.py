@@ -72,7 +72,7 @@ class NovelBot:
         # Lists for skipping bad novels
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set()  # New set for max retry failures
+        self.nwerror = set() # Network/Parsing Errors (Max Retries)
         
         # Topic IDs
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
@@ -118,7 +118,7 @@ class NovelBot:
                 with open(self.files['genfail'], 'r') as f: self.genfail = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Genfail Failed: {e}")
 
-        # --- 5. Load nwerror (Max Retries) ---
+        # --- 5. Load nwerror (Max Retry Failures) ---
         if os.path.exists(self.files['nwerror']):
             try:
                 with open(self.files['nwerror'], 'r') as f: self.nwerror = set(json.load(f))
