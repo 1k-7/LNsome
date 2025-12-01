@@ -41,39 +41,31 @@ class FanMTLCrawler(Crawler):
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
-            # If no title found, it's likely a broken page or a block.
             raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
-        # 3. PRECISE ZERO-CHAPTER CHECK (Improved)
+        # 3. PRECISE ZERO-CHAPTER CHECK (Updated for your HTML)
         is_zero_chapter = False
         
-        # Method A: Specific Tag Structure
-        # Structure: <span><strong><i class="..."></i> No</strong><small>Chapters</small></span>
-        for small in soup.select("small"):
-            if "Chapters" in small.get_text(strip=True):
-                # find_previous_sibling("strong") skips whitespace/newlines to find the tag
-                prev = small.find_previous_sibling("strong")
-                if prev and "No" in prev.get_text(strip=True):
-                    is_zero_chapter = True
-                    break
-        
-        # Method B: Robust Text Fallback (New)
-        # If the tag structure failed (e.g., extra whitespace, different nesting), check the text context.
+        # Check A: Look at the "Read" button text
+        # Your HTML has: <a id="readchapterbtn"> ... <small>No chapter</small> </a>
+        read_btn_small = soup.select_one("#readchapterbtn small")
+        if read_btn_small and "No chapter" in read_btn_small.get_text(strip=True):
+            is_zero_chapter = True
+            logger.info("Detected 'No chapter' in read button.")
+
+        # Check B: Fallback to Header Stats text
         if not is_zero_chapter:
-            # Find the header stats container (usually .novel-info or .header-stats)
             header_stats = soup.select_one(".novel-info") or soup.select_one(".header-stats")
             if header_stats:
-                # Combine text with spaces to handle "No" and "Chapters" being in different tags
                 stats_text = header_stats.get_text(" ", strip=True).lower()
                 if "no chapters" in stats_text or "0 chapters" in stats_text:
                     is_zero_chapter = True
+                    logger.info("Detected 'No Chapters' in header stats.")
         
         if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
-            logger.info("Verified 0-chapter novel.")
-            # CRITICAL: Return immediately. This results in empty chapters list 
-            # without running pagination logic that might crash.
+            logger.info("Verified 0-chapter novel. Returning immediately.")
             return 
 
         # 4. Standard Metadata Extraction
@@ -97,46 +89,53 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # 5. Pagination & Chapter Parsing (Safe Mode)
-        pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        
-        # We wrap this in try-except to catch the 'IndexError' if the site returns weird pagination data
-        try:
-            if pagination:
-                last_page = pagination[-1]
-                common_url = self.absolute_url(last_page["href"]).split("?")[0]
-                params = parse_qs(urlparse(last_page["href"]).query)
+        # 5. Pagination & Chapter Parsing (Paranoid Safe Mode)
+        # In your HTML, the ajax link is OUTSIDE the .pagination ul, so we check both locations.
+        pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
+        if not pagination_links:
+             # Fallback: find the ajax link even if it's not inside .pagination class
+             pagination_links = soup.select('a[data-ajax-update="#chpagedlist"]')
+
+        if pagination_links:
+            try:
+                last_page = pagination_links[-1]
+                href = last_page.get("href")
                 
-                # SAFE EXTRACTION: Check if 'page' exists and has items before accessing [0]
-                page_values = params.get("page", [])
-                if page_values:
-                    page_count = int(page_values[0]) + 1
+                if href:
+                    common_url = self.absolute_url(href).split("?")[0]
+                    query_params = parse_qs(urlparse(href).query)
+                    
+                    # PARANOID EXTRACTION: Check list existence and length explicitly
+                    page_list = query_params.get("page", [])
+                    if page_list and len(page_list) > 0:
+                        page_count = int(page_list[0]) + 1
+                    else:
+                        page_count = 1
+                    
+                    wjm_list = query_params.get("wjm", [])
+                    wjm = wjm_list[0] if wjm_list else ""
+                    
+                    futures = []
+                    for page in range(page_count):
+                        url = f"{common_url}?page={page}&wjm={wjm}"
+                        futures.append(self.executor.submit(self.get_soup, url))
+                    
+                    for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
+                        self.parse_chapter_list(page_soup)
                 else:
-                    page_count = 1 # Fallback if param is missing
-                
-                # Safe extraction for 'wjm'
-                wjm_values = params.get("wjm", [""])
-                wjm = wjm_values[0] if wjm_values else ""
-                
-                futures = []
-                for page in range(page_count):
-                    url = f"{common_url}?page={page}&wjm={wjm}"
-                    futures.append(self.executor.submit(self.get_soup, url))
-                
-                for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
-                    self.parse_chapter_list(page_soup)
-            else:
+                    # Link exists but has no href? Fallback to current page
+                    self.parse_chapter_list(soup)
+            except Exception as e:
+                logger.error(f"Pagination parsing failed: {e}. Falling back to single page list.")
                 self.parse_chapter_list(soup)
-        except Exception as e:
-            logger.error(f"Pagination parsing failed: {e}. Falling back to single page list.")
+        else:
             self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"])
 
         # Final Verification
         if not self.chapters:
-             # If we get here, the list is empty BUT we didn't find the "No Chapters" tag earlier.
-             # This is a parsing failure. Raise Exception to trigger retry.
+             # If we get here, it means checks failed AND no chapters were found.
              raise Exception("Parsing Error: Chapter list empty but 'No Chapters' indicator missing")
 
     def parse_chapter_list(self, soup):
