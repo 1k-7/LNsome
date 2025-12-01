@@ -31,6 +31,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+# OPTIMIZATION: Reduced from 50 to 8 to save CPU/RAM on VPS
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -61,6 +62,7 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
+        # OPTIMIZATION: Reduced from 5 to 2 concurrent novels
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
         
         self.userbot = None
@@ -69,6 +71,7 @@ class NovelBot:
         # State
         self.processed = set()
         self.errors = {}
+        # NEW: Lists for skipping bad novels
         self.nullcon = set()
         self.genfail = set()
         
@@ -98,25 +101,26 @@ class NovelBot:
                 with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
                     self.processed = set(json.load(f))
                 logger.info("♻️ Migrated processed.json")
+                # We don't save immediately to avoid race conditions, will save on next write
             except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
 
-        # --- 2. Load Null Content (0 Chapters) ---
+        # --- 2. Load Errors ---
+        if os.path.exists(self.files['errors']):
+            try:
+                with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
+            except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
+
+        # --- 3. Load Nullcon (0 Chapters) ---
         if os.path.exists(self.files['nullcon']):
             try:
                 with open(self.files['nullcon'], 'r') as f: self.nullcon = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Nullcon Failed: {e}")
 
-        # --- 3. Load Generation Failures ---
+        # --- 4. Load Genfail (Generation Failed) ---
         if os.path.exists(self.files['genfail']):
             try:
                 with open(self.files['genfail'], 'r') as f: self.genfail = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Genfail Failed: {e}")
-
-        # --- 4. Load Errors ---
-        if os.path.exists(self.files['errors']):
-            try:
-                with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
-            except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
 
         # --- 5. Load Topics (Critical) ---
         if not self.target_topic_id or not self.error_topic_id:
@@ -164,15 +168,23 @@ class NovelBot:
 
     def save_success(self, url):
         self.processed.add(url)
-        # Remove from errors/fail lists if it succeeded now
-        if url in self.errors: del self.errors[url]
+        if url in self.errors:
+            del self.errors[url]
+            self.save_errors()
+        # Clean from fail lists if successful
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
-
+        
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Success Failed: {e}")
+
+    def save_errors(self):
+        try:
+            with open(self.files['errors'], 'w') as f: 
+                json.dump(self.errors, f, indent=2)
+        except Exception as e: logger.error(f"⚠️ Save Errors Failed: {e}")
 
     def save_nullcon(self):
         try:
@@ -185,12 +197,6 @@ class NovelBot:
             with open(self.files['genfail'], 'w') as f: 
                 json.dump(list(self.genfail), f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Genfail Failed: {e}")
-
-    def save_errors(self):
-        try:
-            with open(self.files['errors'], 'w') as f: 
-                json.dump(self.errors, f, indent=2)
-        except Exception as e: logger.error(f"⚠️ Save Errors Failed: {e}")
 
     def save_error(self, url, error_msg):
         self.errors[url] = str(error_msg)
@@ -293,8 +299,7 @@ class NovelBot:
             try:
                 with open(queue_path, 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
-                
-                # Filter pending against processed AND skipped lists
+                # Filter pending
                 pending = [
                     u for u in urls 
                     if u not in self.processed 
@@ -307,7 +312,7 @@ class NovelBot:
                     await self.send_log(application.bot, msg)
                     asyncio.create_task(self.process_queue(urls, application.bot))
                 else:
-                    logger.info("✅ Queue file found but all novels processed or skipped. Cleaning up.")
+                    logger.info("✅ Queue file found but all novels processed. Cleaning up.")
                     os.remove(queue_path)
             except Exception as e:
                 logger.error(f"❌ Error processing queue file: {e}")
@@ -381,13 +386,12 @@ class NovelBot:
 
     # --- BOT LOGIC ---
     def start(self):
-        print(f"🚀 Bot Starting...")
-        sys.stdout.flush()
+        print("🚀 Bot Starting...")
+        sys.stdout.flush() # Force logs for Docker
         
+        # FATAL: Check token
         if not TOKEN:
-            print("❌ FATAL ERROR: TELEGRAM_TOKEN is missing from environment!")
-            print("❌ Check your docker run command or .env file.")
-            sys.stdout.flush()
+            print("❌ FATAL ERROR: TELEGRAM_TOKEN missing!")
             sys.exit(1)
 
         app = Application.builder().token(TOKEN).post_init(self.post_init).build()
@@ -451,7 +455,7 @@ class NovelBot:
         # Clean once before batch starts
         gc.collect()
         
-        # Filter: Not processed AND Not in nullcon AND Not in genfail
+        # Filter against processed AND failed lists
         to_process = []
         skipped_null = 0
         skipped_fail = 0
@@ -476,7 +480,7 @@ class NovelBot:
         for url in to_process:
             if url in self.processed: continue
             await self.process_novel(url, bot)
-            # gc.collect() - Removed per-novel GC to reduce CPU spike, rely on worker GC
+            # gc.collect() - Removed per-novel GC to reduce CPU spike
         
         await self.send_log(bot, "✅ **All Tasks Finished**")
         if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
@@ -558,7 +562,7 @@ class NovelBot:
                 await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
         except Exception as e:
             err_msg = str(e)
-            # FIX: Catch "IndexError" explicitly here to log clean "No chapters" message
+            # LOGIC FIX: Catch both specific "No chapters" exception AND generic IndexError (which means list was empty)
             if "No chapters extracted" in err_msg or "IndexError" in err_msg or "list index out of range" in err_msg:
                 self.nullcon.add(url)
                 self.save_nullcon()
@@ -571,9 +575,8 @@ class NovelBot:
                 self.save_error(url, str(e))
 
     def _scrape_logic(self, url: str, progress_queue):
-        app = None # Initialize for finally block
+        app = App()
         try:
-            app = App()
             progress_queue.put(f"🔍 Fetching info...")
             app.user_input = url
             app.prepare_search()
@@ -584,7 +587,7 @@ class NovelBot:
             if app.crawler.novel_cover:
                 try:
                     headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
-                    response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=10)
+                    response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=15)
                     if response.status_code == 200:
                         cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
                         with open(cover_path, 'wb') as f: f.write(response.content)
@@ -592,9 +595,6 @@ class NovelBot:
                 except: pass
 
             app.chapters = app.crawler.chapters[:]
-            if not app.chapters:
-                raise Exception("No chapters extracted")
-
             app.pack_by_volume = False
             app.output_formats = {'epub': True}
             
@@ -613,19 +613,17 @@ class NovelBot:
 
             progress_queue.put("📦 Binding...")
             
-            # FIX: Catch IndexError here to prevent crash if list becomes empty
+            # FIX: Wrap bind_books in try-except to catch IndexError and raise clean message
             try:
                 for fmt, f in app.bind_books(): return f
             except IndexError:
-                raise Exception("No chapters found (IndexError during binding)")
+                raise Exception("No chapters extracted (IndexError during binding)")
                 
             return None
 
         except Exception as e: raise e
         finally: 
-            if app:
-                app.destroy()
-                del app
+            app.destroy()
             gc.collect()
 
 if __name__ == "__main__":

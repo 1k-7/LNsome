@@ -1,3 +1,4 @@
+# REMOVED: import atexit - This was causing the memory leak
 import logging
 import os
 from pathlib import Path
@@ -51,7 +52,7 @@ class App:
         self.fetch_chapter_progress: float = 0
         self.fetch_images_progress: float = 0
         self.binding_progress: float = 0
-        # REMOVED atexit.register to fix memory leak
+        # REMOVED: atexit.register(self.destroy)
 
     @property
     def progress(self):
@@ -77,7 +78,7 @@ class App:
     # ----------------------------------------------------------------------- #
 
     def destroy(self):
-        # REMOVED atexit.unregister
+        # REMOVED: atexit.unregister(self.destroy)
         if self.crawler:
             self.crawler.close()
             self.crawler = None
