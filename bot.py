@@ -565,7 +565,7 @@ class NovelBot:
                 
                 # --- RETRY CONDITIONS ---
                 # Check for Cloudflare, Blocks, or specific HTTP errors that warrant a retry
-                # REMOVED "IndexError" / "list index out of range" to prevent hang on empty/broken novels
+                # REMOVED "IndexError" / "list index out of range" to prevent spam loops on broken novels
                 if any(x in err_msg for x in ["Cloudflare", "Block", "403", "503", "504", "Connection closed", "Failed to parse novel title"]):
                     wait_time = 60
                     logger.error(f"⚠️ Blocked/Network Error: {url} -> {e}")
@@ -580,7 +580,7 @@ class NovelBot:
                 # --- FAILURE CONDITIONS ---
                 elif "No chapters extracted" in err_msg:
                     # STRICTLY only add to nullcon if it's explicitly "No chapters extracted"
-                    # This happens when the title was found (so not a block) but the chapter list was empty.
+                    # This happens when fanmtl.py returns 0 chapters (swallows the crash).
                     self.nullcon.add(url)
                     self.save_nullcon()
                     try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)

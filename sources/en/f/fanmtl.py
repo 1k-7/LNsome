@@ -32,7 +32,6 @@ class FanMTLCrawler(Crawler):
             self.novel_title = possible_title.text.strip()
         else:
             # FIX: Robust Cloudflare/Block Detection
-            # If we can't find the title, check if it's a specific block page.
             body_text = soup.body.text.lower() if soup.body else ""
             block_keywords = [
                 "just a moment", 
@@ -46,9 +45,10 @@ class FanMTLCrawler(Crawler):
             if any(keyword in body_text for keyword in block_keywords):
                 raise Exception("Cloudflare Blocked Request")
             
-            # CRITICAL: If no title is found and it's not a known block, we still raise an exception.
-            # We DO NOT return "Unknown Novel", because that would make the bot think 
-            # it is a valid novel with 0 chapters and add it to nullcon.
+            # If no title and not a block, it's a broken page.
+            # Raise exception to trigger retry (or fail) depending on bot policy.
+            # However, for "no chapter" novels, we often get here too.
+            # Let's assume layout failure -> retry, but empty chapter list -> nullcon.
             raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
@@ -71,16 +71,19 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # FIX: Safer pagination logic to prevent "list index out of range"
-        pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        if not pagination:
-            self.parse_chapter_list(soup)
-        else:
-            try:
+        # FIX: CRITICAL WRAPPER
+        # Wrap all parsing in try/except. If it fails (IndexError), 
+        # we treat it as 0 chapters found instead of crashing the bot.
+        try:
+            pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
+            if not pagination:
+                self.parse_chapter_list(soup)
+            else:
                 last_page = pagination[-1]
                 common_url = self.absolute_url(last_page["href"]).split("?")[0]
                 params = parse_qs(urlparse(last_page["href"]).query)
                 
+                # These list accesses were causing the IndexError
                 page_count = int(params.get("page", [0])[0]) + 1
                 wjm = params.get("wjm", [""])[0]
                 
@@ -91,10 +94,10 @@ class FanMTLCrawler(Crawler):
                 
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
-            except Exception as e:
-                # Fallback to single page parsing if pagination math fails
-                logger.error(f"Pagination logic failed: {e}. Falling back to single page.")
-                self.parse_chapter_list(soup)
+        except Exception as e:
+            # Log error but DO NOT CRASH. 
+            # This allows the bot to see "0 chapters" and add to nullcon.
+            logger.error(f"Parsing failed (treating as empty/broken novel): {e}")
 
         self.chapters.sort(key=lambda x: x["id"])
 
