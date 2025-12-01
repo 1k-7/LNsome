@@ -14,7 +14,6 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # FIX: Set threads to 8 as requested
         self.init_executor(8)
         self.cleaner.bad_css.update({'div[align="center"]'})
 
@@ -27,24 +26,20 @@ class FanMTLCrawler(Crawler):
         logger.debug("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
-        # 1. Cloudflare/Block Detection
+        # 1. Cloudflare Check
         body_text = soup.body.text.lower() if soup.body else ""
-        block_keywords = [
-            "just a moment", "attention required", "verify you are human", 
-            "security check", "ray id", "enable javascript"
-        ]
-        if any(keyword in body_text for keyword in block_keywords):
+        if "verify you are human" in body_text or "just a moment" in body_text:
             raise Exception("Cloudflare Blocked Request")
 
-        # 2. Metadata Extraction
+        # 2. Title
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
-            # Fallback if title parsing fails
             meta_title = soup.select_one('meta[property="og:title"]')
             self.novel_title = meta_title.get("content").strip() if meta_title else "Unknown Title"
 
+        # 3. Metadata
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
             url = img_tag.get("src")
@@ -60,45 +55,37 @@ class FanMTLCrawler(Crawler):
 
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
-        
-        # 3. Pagination & Chapter Parsing
-        # REFERENCE LOGIC from LNAutoCrawl: Check if pagination exists.
+
+        # 4. Pagination Logic
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
         if not pagination_links:
-            # Case: < 100 Chapters (No pagination bar)
-            # Parse the chapters directly from the current page
+            # Case: < 100 chapters (No pagination)
             self.parse_chapter_list(soup)
         else:
-            # Case: > 100 Chapters (Pagination exists)
+            # Case: > 100 chapters
             try:
                 last_page = pagination_links[-1]
                 href = last_page.get("href")
+                common_url = self.absolute_url(href).split("?")[0]
+                query = parse_qs(urlparse(href).query)
                 
-                if href:
-                    common_url = self.absolute_url(href).split("?")[0]
-                    query_params = parse_qs(urlparse(href).query)
-                    
-                    # Safe extraction with defaults to prevent IndexError
-                    page_list = query_params.get("page", [])
-                    page_count = int(page_list[0]) + 1 if page_list else 1
-                    
-                    wjm_list = query_params.get("wjm", [])
-                    wjm = wjm_list[0] if wjm_list else ""
-                    
-                    futures = []
-                    for page in range(page_count):
-                        url = f"{common_url}?page={page}&wjm={wjm}"
-                        futures.append(self.executor.submit(self.get_soup, url))
-                    
-                    for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
-                        self.parse_chapter_list(page_soup)
-                else:
-                    # Link exists but invalid? Fallback to single page
-                    self.parse_chapter_list(soup)
+                # Safe Extraction
+                page_list = query.get("page", [])
+                page_count = int(page_list[0]) + 1 if page_list else 1
+                
+                wjm_list = query.get("wjm", [])
+                wjm = wjm_list[0] if wjm_list else ""
+
+                futures = []
+                for page in range(page_count):
+                    url = f"{common_url}?page={page}&wjm={wjm}"
+                    futures.append(self.executor.submit(self.get_soup, url))
+                
+                for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
+                    self.parse_chapter_list(page_soup)
             except Exception as e:
-                # If pagination logic crashes (e.g. weird URL), fallback to single page
-                logger.error(f"Pagination logic failed: {e}. Falling back to single page.")
+                logger.error(f"Pagination error: {e}. Fallback to single page.")
                 self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
