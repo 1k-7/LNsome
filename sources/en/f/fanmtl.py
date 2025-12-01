@@ -14,11 +14,11 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        self.init_executor(8)
+        self.init_executor(2) # Keep consistent with bot.py optimizations
         self.cleaner.bad_css.update({'div[align="center"]'})
 
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
 
@@ -32,54 +32,61 @@ class FanMTLCrawler(Crawler):
             raise Exception("Cloudflare Blocked Request")
 
         # 2. Title Extraction
-        possible_title = soup.select_one("h1.novel-title")
-        if possible_title:
-            self.novel_title = possible_title.text.strip()
-        else:
-            # Fallback for broken pages
+        try:
+            possible_title = soup.select_one("h1.novel-title")
+            if possible_title:
+                self.novel_title = possible_title.text.strip()
+            else:
+                meta_title = soup.select_one('meta[property="og:title"]')
+                self.novel_title = meta_title.get("content").strip() if meta_title else "Unknown Title"
+        except:
             self.novel_title = "Unknown Title"
 
-        # 3. "No Chapters" Detection
-        # If we find explicit "No chapter" text, we stop immediately.
+        # 3. "No Chapters" Detection (The "Nullcon" logic)
         is_zero_chapter = False
-        read_btn = soup.select_one("#readchapterbtn")
-        header_stats = soup.select_one(".novel-info .header-stats")
-        
-        if read_btn and "no chapter" in read_btn.get_text(" ", strip=True).lower():
-            is_zero_chapter = True
-        elif header_stats and "no chapters" in header_stats.get_text(" ", strip=True).lower():
-            is_zero_chapter = True
+        try:
+            read_btn = soup.select_one("#readchapterbtn")
+            header_stats = soup.select_one(".novel-info .header-stats")
             
+            if read_btn and "no chapter" in read_btn.get_text(" ", strip=True).lower():
+                is_zero_chapter = True
+            elif header_stats and "no chapters" in header_stats.get_text(" ", strip=True).lower():
+                is_zero_chapter = True
+        except: pass
+
         if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
-            logger.info("Verified 0-chapter novel. Returning early.")
+            logger.info("Verified 0-chapter novel. Returning.")
             return
 
-        # 4. Metadata
-        img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
-        if img_tag:
-            url = img_tag.get("src")
-            if "placeholder" in str(url) and img_tag.get("data-src"):
-                url = img_tag.get("data-src")
-            self.novel_cover = self.absolute_url(url)
+        # 4. Metadata Extraction
+        try:
+            img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
+            if img_tag:
+                url = img_tag.get("src")
+                if "placeholder" in str(url) and img_tag.get("data-src"):
+                    url = img_tag.get("data-src")
+                self.novel_cover = self.absolute_url(url)
 
-        author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
-        if author_tag:
-            self.novel_author = author_tag.text.strip()
-        else:
-            self.novel_author = "Unknown"
+            author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
+            if author_tag:
+                self.novel_author = author_tag.text.strip()
+            else:
+                self.novel_author = "Unknown"
+
+            summary_div = soup.select_one(".summary .content")
+            self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
+        except: pass
 
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
-        # 5. Pagination (CRASH-PROOF METHOD)
+        # 5. Pagination (Crash-Proof)
         try:
-            # Only look for pagination in the specific list container
             pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
             
             if pagination_links:
-                # Get the last link safely
                 last_page_link = pagination_links[-1] 
                 href = last_page_link.get("href")
                 
@@ -87,16 +94,13 @@ class FanMTLCrawler(Crawler):
                     common_url = self.absolute_url(href).split("?")[0]
                     query = parse_qs(urlparse(href).query)
                     
-                    # SAFELY get page count. 
-                    # parse_qs returns a list, e.g., {'page': ['5']}.
-                    # We verify the list exists AND has items before accessing [0].
+                    # PARANOID LIST ACCESS
                     page_param = query.get("page")
                     if page_param and len(page_param) > 0:
                         page_count = int(page_param[0]) + 1
                     else:
-                        page_count = 1 # Default if param missing
+                        page_count = 1 
                         
-                    # SAFELY get wjm param
                     wjm_param = query.get("wjm")
                     wjm = wjm_param[0] if (wjm_param and len(wjm_param) > 0) else ""
 
@@ -108,38 +112,36 @@ class FanMTLCrawler(Crawler):
                     for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                         self.parse_chapter_list(page_soup)
                 else:
-                    # Link existed but had no href? Parse current page.
                     self.parse_chapter_list(soup)
             else:
-                # No pagination found? Parse current page.
                 self.parse_chapter_list(soup)
 
         except Exception as e:
-            # If ANYTHING goes wrong in pagination, log it and just parse the current page.
-            # This prevents the crawler from crashing.
             logger.error(f"Pagination error: {e}. Fallback to single page.")
             self.parse_chapter_list(soup)
 
         # 6. Safe Sort
-        # Handles objects or dicts safely
-        self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
+        try:
+            self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
+        except: pass
 
-        # 7. Final Safety Check
         if not self.chapters:
-            logger.warning("Chapter list is empty. Returning empty list instead of crashing.")
+            logger.warning("No chapters found. Returning gracefully.")
             return
 
     def parse_chapter_list(self, soup):
         if not soup: return
-        for a in soup.select("ul.chapter-list li a"):
-            try:
-                self.chapters.append(Chapter(
-                    id=len(self.chapters) + 1,
-                    volume=1,
-                    url=self.absolute_url(a["href"]),
-                    title=a.select_one(".chapter-title").text.strip(),
-                ))
-            except: pass
+        try:
+            for a in soup.select("ul.chapter-list li a"):
+                try:
+                    self.chapters.append(Chapter(
+                        id=len(self.chapters) + 1,
+                        volume=1,
+                        url=self.absolute_url(a["href"]),
+                        title=a.select_one(".chapter-title").text.strip(),
+                    ))
+                except: pass
+        except: pass
 
     def download_chapter_body(self, chapter):
         soup = self.get_soup(chapter["url"])

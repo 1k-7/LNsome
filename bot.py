@@ -4,14 +4,14 @@ import json
 import logging
 import asyncio
 import shutil
-import queue
 import time
 import urllib3
 import gc
 import uuid
 import zipfile
 import datetime
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
 from telegram.ext import (
@@ -31,7 +31,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# FIX: Reduced from 50 to 8 to prevent RAM exhaustion
+# KEEPING AS REQUESTED: High thread count for scraping speed
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -62,8 +62,10 @@ pending_uploads = {}
 
 class NovelBot:
     def __init__(self):
-        # FIX: Reduced max_workers to 2
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bot_worker")
+        # OPTIMIZATION: Switched to ProcessPoolExecutor.
+        # Processes release memory back to OS better than threads and bypass the GIL.
+        self.executor = ProcessPoolExecutor(max_workers=2)
+        self.manager = multiprocessing.Manager()
         
         self.userbot = None
         self.bot_username = None 
@@ -175,7 +177,7 @@ class NovelBot:
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
-        # FIX: Remove from bad lists if successful
+        # Remove from bad lists if successful
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         if url in self.nwerror: self.nwerror.remove(url)
@@ -312,7 +314,7 @@ class NovelBot:
                 with open(queue_path, 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
-                # FIX: Filter pending against all lists including nwerror
+                # Filter pending against all lists including nwerror
                 pending = [
                     u for u in urls 
                     if u not in self.processed 
@@ -467,10 +469,8 @@ class NovelBot:
             if os.path.exists(temp_path): os.remove(temp_path)
 
     async def process_queue(self, urls, bot):
-        # Clean once before batch starts
         gc.collect()
         
-        # Filter against all lists
         to_process = []
         skipped_null = 0
         skipped_fail = 0
@@ -502,37 +502,45 @@ class NovelBot:
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
         
-        # RETRY LOOP: Keeps trying until success or non-recoverable error
         retry_count = 0
         MAX_RETRIES = 2
         
         while True:
-            progress_queue = queue.Queue()
+            # Use Manager Queue for multiprocessing
+            progress_queue = self.manager.Queue()
             loop = asyncio.get_running_loop()
             start_time = time.time()
             
-            # Submit task to executor
             future = loop.run_in_executor(self.executor, self._scrape_logic, url, progress_queue)
             
-            # Monitor progress
             last_text = ""
             last_update = 0
+            
+            # Polling queue for progress updates
             while not future.done():
                 try:
-                    text = progress_queue.get_nowait()
-                    if text != last_text and (time.time() - last_update) > 5:
-                        try: 
-                            await self.send_log(bot, text, edit_msg=status_msg)
-                            last_text = text; last_update = time.time()
-                        except: pass
-                except queue.Empty: await asyncio.sleep(0.5)
+                    # Using get_nowait() with exception handling for non-blocking check
+                    try:
+                        text = progress_queue.get_nowait()
+                        if text != last_text and (time.time() - last_update) > 5:
+                            try: 
+                                await self.send_log(bot, text, edit_msg=status_msg)
+                                last_text = text; last_update = time.time()
+                            except: pass
+                    except queue.Empty:
+                        pass # Standard Queue Empty
+                    except Exception:
+                         pass # Manager Queue weirdness
+                    
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    await asyncio.sleep(0.5)
 
             try:
                 epub_path = await future
                 duration = int(time.time() - start_time)
                 
                 if epub_path and os.path.exists(epub_path):
-                    # --- SUCCESS HANDLER ---
                     file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
                     caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
                     
@@ -574,27 +582,25 @@ class NovelBot:
                             self.save_success(url)
 
                     os.remove(epub_path)
-                    break # Success! Break the retry loop
+                    break
                 else:
                     self.genfail.add(url)
                     self.save_genfail()
                     await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
-                    break # Logic error (no file), break loop
+                    break
 
             except Exception as e:
                 err_msg = str(e)
                 
-                # --- CASE 1: 0 Chapters (Strictly checked by fanmtl.py) ---
-                if "No chapters extracted" in err_msg:
-                    # Only add to nullcon if it's explicitly "No chapters extracted"
-                    # This happens when the title was found (so not a block) but the chapter list was empty.
+                # --- NULLCON / INDEX ERROR HANDLER ---
+                if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
                     self.nullcon.add(url)
                     self.save_nullcon()
-                    try: await self.send_log(bot, f"⚠️ {url}: 0 Chapters (Added to nullcon)", edit_msg=status_msg)
+                    try: await self.send_log(bot, f"⚠️ {url}: Nullcon/Index Error (Saved to nullcon, NO RETRY)", edit_msg=status_msg)
                     except: pass
-                    break # Stop retrying
-
-                # --- CASE 2: Retry Logic (All other errors including parsing/network) ---
+                    break # BREAK LOOP IMMEDIATELY
+                
+                # --- STANDARD RETRY ---
                 else:
                     if retry_count < MAX_RETRIES:
                         retry_count += 1
@@ -605,18 +611,24 @@ class NovelBot:
                         except: pass
                         
                         await asyncio.sleep(wait_time)
+                        # GC in main process
                         gc.collect()
-                        continue # RESTART LOOP (Retry)
+                        continue
                     else:
-                        # --- CASE 3: Max Retries Exceeded -> nwerror ---
                         logger.error(f"❌ Max Retries Exceeded: {url} -> {e}")
                         self.nwerror.add(url)
                         self.save_nwerror()
                         try: await self.send_log(bot, f"❌ Max Retries Exceeded: {url} (Added to nwerror)", edit_msg=status_msg)
                         except: pass
-                        break # Stop retrying
+                        break
 
+    # Static method not required, but cleaner for pickling if outside class in some versions,
+    # but instance methods work with spawn/fork usually if self is picklable. 
+    # Safest to keep it here but be aware of self dependencies.
     def _scrape_logic(self, url: str, progress_queue):
+        # Ensure sources are loaded in the worker process
+        load_sources()
+        
         app = App()
         try:
             progress_queue.put(f"🔍 Fetching info...")
@@ -624,7 +636,9 @@ class NovelBot:
             app.prepare_search()
             app.get_novel_info()
             
-            if app.crawler: app.crawler.init_executor(THREADS_PER_NOVEL)
+            if app.crawler: 
+                # Keep user's desired thread count
+                app.crawler.init_executor(THREADS_PER_NOVEL)
 
             if app.crawler.novel_cover:
                 try:
@@ -638,6 +652,7 @@ class NovelBot:
 
             app.chapters = app.crawler.chapters[:]
             if not app.chapters:
+                # This raises Exception which is caught in process_novel
                 raise Exception("No chapters extracted")
 
             app.pack_by_volume = False
@@ -658,18 +673,21 @@ class NovelBot:
 
             progress_queue.put("📦 Binding...")
             
-            # FIX: Catch IndexError inside worker
             try:
                 for fmt, f in app.bind_books(): return f
             except IndexError:
+                 # Specific error for process_novel logic to catch
                  raise Exception("No chapters extracted (IndexError during binding)")
             return None
 
         except Exception as e: raise e
         finally: 
             app.destroy()
+            # Force GC in worker process
             gc.collect()
 
 if __name__ == "__main__":
+    # Ensure proper multiprocessing behavior on Windows/macOS
+    multiprocessing.freeze_support()
     bot = NovelBot()
     bot.start()
