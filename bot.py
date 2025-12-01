@@ -124,7 +124,7 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # ProcessPoolExecutor for isolation
+        # Use ProcessPoolExecutor for CPU isolation
         self.executor = ProcessPoolExecutor(max_workers=2)
         self.manager = multiprocessing.Manager()
         
@@ -136,7 +136,7 @@ class NovelBot:
         self.errors = {}
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set() # Kept for legacy loading, but not saved/used logic-wise
+        self.nwerror = set() # Kept for legacy file loading but not used logic-wise
         
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
         self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
@@ -163,7 +163,7 @@ class NovelBot:
                 logger.info("♻️ Migrated processed.json")
             except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
 
-        # --- 2. Load Errors ---
+        # --- 2. Load Errors (Legacy) ---
         if os.path.exists(self.files['errors']):
             try:
                 with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
@@ -224,15 +224,17 @@ class NovelBot:
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
-        # Clean up from bad lists
+        
+        # Remove from bad lists
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
+        
         # Save Processed
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Processed Failed: {e}")
-        # Sync removals
+        
         self.save_nullcon()
         self.save_genfail()
 
@@ -276,31 +278,24 @@ class NovelBot:
         self.load_data()
 
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
-            topics_changed = False
             try:
                 if not self.target_topic_id:
                     logger.info("🆕 Creating Target Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=TARGET_GROUP_ID, name=f"📚 {self.bot_username} Novels")
                     self.target_topic_id = topic.message_thread_id
-                    topics_changed = True
+                    self.save_topics()
                 
                 if not self.error_topic_id:
                     logger.info("🆕 Creating Error/Log Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🛠 {self.bot_username} Logs")
                     self.error_topic_id = topic.message_thread_id
-                    topics_changed = True
+                    self.save_topics()
 
                 if not self.backup_topic_id:
                     logger.info("🆕 Creating Backup Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🗄️ {self.bot_username} Backup")
                     self.backup_topic_id = topic.message_thread_id
-                    topics_changed = True
-                
-                if topics_changed or not os.path.exists(self.files['topics']):
-                    self.save_topics() 
-                
-                logger.info(f"🎯 Configuration: Target={self.target_topic_id} | Logs={self.error_topic_id}")
-
+                    self.save_topics()
             except Exception as e:
                 logger.error(f"❌ Failed to configure topics: {e}")
 
@@ -319,32 +314,32 @@ class NovelBot:
                 logger.error(f"❌ Userbot Failed: {e}")
 
         asyncio.create_task(self.backup_loop(application.bot))
-
-        # Queue Processing (Resume)
-        queue_path = self.files['queue']
-        if os.path.exists(queue_path):
+        
+        # Process Queue
+        if os.path.exists(self.files['queue']):
             try:
-                with open(queue_path, 'r') as f: data = json.load(f)
+                with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
                 # Filter: processed, nullcon, genfail are skipped.
-                # Network errors (nwerror) from previous run ARE retried (since we don't save them).
-                pending = [
+                to_process = [
                     u for u in urls 
                     if u not in self.processed 
                     and u not in self.nullcon 
                     and u not in self.genfail
                 ]
                 
-                if pending:
-                    msg = f"🔄 **Restarted**\nResuming {len(pending)} novels..."
-                    await self.send_log(application.bot, msg)
-                    asyncio.create_task(self.process_queue(urls, application.bot))
-                else:
-                    logger.info("✅ Queue file found but all novels processed. Cleaning up.")
-                    os.remove(queue_path)
+                if to_process:
+                    await self.send_log(application.bot, f"🔄 **Restarted**\nResuming {len(to_process)} novels...")
+                    asyncio.create_task(self.process_queue(to_process, application.bot))
+                elif urls:
+                     await self.send_log(application.bot, "ℹ️ Queue exists but all novels processed/skipped. Clearing.")
+                     os.remove(self.files['queue'])
+
             except Exception as e:
                 logger.error(f"❌ Error processing queue file: {e}")
+        else:
+            logger.info("ℹ️ No pending queue found.")
 
     async def send_log(self, bot, text, edit_msg=None):
         if ERROR_GROUP_ID and self.error_topic_id:
@@ -367,39 +362,19 @@ class NovelBot:
 
     async def perform_backup(self, bot):
         if not ERROR_GROUP_ID or not self.backup_topic_id: return
-
         try:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
             zip_name = f"backup_{self.bot_username}_{timestamp}.zip"
             zip_path = os.path.join(DATA_DIR, zip_name)
-            
-            files_to_backup = [
-                f for f in os.listdir(DATA_DIR) 
-                if f.endswith('.json') 
-                and self.bot_username in f
-                and os.path.isfile(os.path.join(DATA_DIR, f))
-            ]
-            
+            files_to_backup = [f for f in os.listdir(DATA_DIR) if f.endswith('.json') and self.bot_username in f]
             if not files_to_backup: return
-
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for file_name in files_to_backup:
-                    full_path = os.path.join(DATA_DIR, file_name)
-                    zf.write(full_path, file_name)
-            
-            caption = f"🗄️ **Daily Backup**\n📅 {timestamp}\n📂 Files: {len(files_to_backup)}"
-
+                    zf.write(os.path.join(DATA_DIR, file_name), file_name)
             with open(zip_path, 'rb') as f:
-                await bot.send_document(
-                    chat_id=ERROR_GROUP_ID,
-                    message_thread_id=self.backup_topic_id,
-                    document=f,
-                    caption=caption
-                )
-            
+                await bot.send_document(chat_id=ERROR_GROUP_ID, message_thread_id=self.backup_topic_id, document=f, caption=f"🗄️ Backup {timestamp}")
             if os.path.exists(zip_path): os.remove(zip_path)
             logger.info("✅ Backup uploaded successfully")
-            
         except Exception as e:
             logger.error(f"Backup Failed: {e}")
             await self.send_log(bot, f"⚠️ Backup Failed: {e}")
@@ -407,7 +382,9 @@ class NovelBot:
     def start(self):
         print("🚀 Bot Starting...")
         sys.stdout.flush()
-        if not TOKEN: sys.exit(1)
+        if not TOKEN:
+            print("❌ FATAL ERROR: TELEGRAM_TOKEN missing!")
+            sys.exit(1)
 
         app = Application.builder().token(TOKEN).post_init(self.post_init).build()
         app.add_handler(CommandHandler("start", self.cmd_start))
@@ -415,7 +392,6 @@ class NovelBot:
         app.add_handler(CommandHandler("backup", self.cmd_force_backup))
         app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
-        
         load_sources()
         app.run_polling()
 
@@ -448,10 +424,8 @@ class NovelBot:
         await file.download_to_drive(temp_path)
         try:
             with open(temp_path, 'r', encoding='utf-8') as f: urls = json.load(f)
-            
             with open(self.files['queue'], 'w') as f:
                 json.dump({"chat_id": update.effective_chat.id, "urls": urls}, f, indent=2)
-            
             await update.message.reply_text(f"✅ Received {len(urls)} novels. Check Log Group for progress.")
             await self.process_queue(urls, context.bot)
         except Exception as e:
@@ -462,29 +436,24 @@ class NovelBot:
 
     async def process_queue(self, urls, bot):
         gc.collect()
-        
         to_process = []
-        skipped_null = 0
-        skipped_fail = 0
+        skipped = 0
         
         for u in urls:
-            if u in self.processed: continue
-            if u in self.nullcon: 
-                skipped_null += 1
-                continue
-            if u in self.genfail:
-                skipped_fail += 1
+            if u in self.processed or u in self.nullcon or u in self.genfail:
+                skipped += 1
                 continue
             to_process.append(u)
 
         if not to_process:
             if os.path.exists(self.files['queue']): os.remove(self.files['queue'])
-            await self.send_log(bot, f"✅ **Queue Complete**\n(Skipped: {skipped_null} null, {skipped_fail} failed)")
+            await self.send_log(bot, f"✅ **Queue Complete**\n(Skipped: {skipped} already processed/failed)")
             return
 
-        await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped_null} null, {skipped_fail} failed)")
+        await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped})")
         
         for url in to_process:
+            # Double check
             if url in self.processed: continue
             await self.process_novel(url, bot)
             gc.collect()
@@ -499,7 +468,7 @@ class NovelBot:
         loop = asyncio.get_running_loop()
         start_time = time.time()
         
-        # Submit task to executor (Global Worker)
+        # ONE SHOT execution
         future = loop.run_in_executor(self.executor, scrape_logic_worker, url, progress_queue)
         
         last_text = ""
@@ -523,12 +492,12 @@ class NovelBot:
             duration = int(time.time() - start_time)
             
             if epub_path and os.path.exists(epub_path):
+                # --- SUCCESS ---
                 file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
                 caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
-                
                 try: await status_msg.delete()
                 except: pass
-
+                
                 dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
                 dest_topic_id = self.target_topic_id
 
@@ -537,7 +506,7 @@ class NovelBot:
                     return
 
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
-                    prog_msg = await self.send_log(bot, f"⚠️ File is {file_size_mb:.1f}MB (> {USERBOT_THRESHOLD}MB)\n🚀 Uploading via Userbot...")
+                    prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
                     try:
                         await self.userbot.send_document(
                             chat_id=int(dest_chat_id),
@@ -552,7 +521,7 @@ class NovelBot:
                 else:
                     if file_size_mb >= 50:
                         await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
-                        # Don't save error -> Retry later
+                        self.save_error(url, "File > 50MB & No Userbot")
                     else:
                         with open(epub_path, 'rb') as f:
                             await bot.send_document(
@@ -565,24 +534,23 @@ class NovelBot:
 
                 os.remove(epub_path)
             else:
-                # Genfail: Save and DO NOT RETRY
+                # Genfail (No file)
                 self.genfail.add(url)
                 self.save_genfail()
-                await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
+                await self.send_log(bot, f"❌ Gen Failed: {url}", edit_msg=status_msg)
 
         except Exception as e:
             err_msg = str(e)
             
-            # Nullcon: Save and DO NOT RETRY
-            if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
+            # Nullcon (IndexError / Empty)
+            if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg or "No chapters found" in err_msg:
                 self.nullcon.add(url)
                 self.save_nullcon()
-                try: await self.send_log(bot, f"⚠️ {url}: Null Content/Index Error (Added to nullcon)", edit_msg=status_msg)
-                except: pass
+                await self.send_log(bot, f"⚠️ **Null Content:** {url}", edit_msg=status_msg)
             
-            # Network/Other: Log only. Retry on next restart.
+            # Network/Other (Not Saved)
             else:
-                await self.send_log(bot, f"❌ **Error:** {e}\n{url} (Not Saved)", edit_msg=status_msg)
+                await self.send_log(bot, f"❌ **Error:** {e}\n{url}", edit_msg=status_msg)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()

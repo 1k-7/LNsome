@@ -30,7 +30,8 @@ class FanMTLCrawler(Crawler):
         if possible_title:
             self.novel_title = possible_title.text.strip()
         else:
-            self.novel_title = "Unknown Title"
+            meta_title = soup.select_one('meta[property="og:title"]')
+            self.novel_title = meta_title.get("content").strip() if meta_title else "Unknown Title"
 
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
@@ -40,10 +41,7 @@ class FanMTLCrawler(Crawler):
             self.novel_cover = self.absolute_url(url)
 
         author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
-        if author_tag:
-            self.novel_author = author_tag.text.strip()
-        else:
-            self.novel_author = "Unknown"
+        self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
 
         summary_div = soup.select_one(".summary .content")
         self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
@@ -52,21 +50,19 @@ class FanMTLCrawler(Crawler):
         self.chapters = []
 
         # --- PAGINATION LOGIC ---
-        # This logic is taken directly from your working reference.
-        pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
+        pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
-        if not pagination:
-            # NO PAGINATION FOUND: This is a novel with < 100 chapters.
-            # Parse the current page immediately.
+        if not pagination_links:
+            # If no pagination, it's < 100 chapters. Parse current page.
             self.parse_chapter_list(soup)
         else:
-            # Pagination found.
             try:
-                last_page = pagination[-1]
-                common_url = self.absolute_url(last_page["href"]).split("?")[0]
-                query = parse_qs(urlparse(last_page["href"]).query)
+                last_page = pagination_links[-1]
+                href = last_page.get("href")
+                common_url = self.absolute_url(href).split("?")[0]
+                query = parse_qs(urlparse(href).query)
                 
-                # Use .get() with a default list to prevent IndexError
+                # Safe extraction logic
                 page_params = query.get("page", ["0"])
                 page_count = int(page_params[0]) + 1
                 
@@ -80,8 +76,8 @@ class FanMTLCrawler(Crawler):
                 
                 for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
                     self.parse_chapter_list(page_soup)
-            except Exception:
-                # If pagination fails, fall back to single page parsing
+            except Exception as e:
+                logger.error(f"Pagination failed: {e}. Parsing current page.")
                 self.parse_chapter_list(soup)
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
