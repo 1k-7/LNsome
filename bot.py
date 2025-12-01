@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 import shutil
+import queue
 import time
 import urllib3
 import gc
@@ -31,7 +32,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# KEEPING AS REQUESTED: High thread count for scraping speed
+# Preserving your requested thread count
 THREADS_PER_NOVEL = 8
 
 # Group Configs (Must be -100xxxx format)
@@ -60,10 +61,75 @@ logger = logging.getLogger(__name__)
 
 pending_uploads = {}
 
+# --- WORKER FUNCTION (Must be global for ProcessPoolExecutor) ---
+def scrape_logic_worker(url, progress_queue):
+    """
+    Runs the scraping logic in a separate process.
+    Communicates progress back via the multiprocessing Queue.
+    """
+    # Reload sources in the new process context
+    load_sources()
+    
+    app = App()
+    try:
+        if progress_queue: progress_queue.put("🔍 Fetching info...")
+        
+        app.user_input = url
+        app.prepare_search()
+        app.get_novel_info()
+        
+        # Initialize crawler threads inside the process
+        if app.crawler: 
+            app.crawler.init_executor(THREADS_PER_NOVEL)
+
+        if app.crawler.novel_cover:
+            try:
+                headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
+                response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
+                    with open(cover_path, 'wb') as f: f.write(response.content)
+                    app.book_cover = cover_path
+            except: pass
+
+        app.chapters = app.crawler.chapters[:]
+        if not app.chapters:
+            raise Exception("No chapters extracted")
+
+        app.pack_by_volume = False
+        app.output_formats = {'epub': True}
+        
+        total = len(app.chapters)
+        if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
+        
+        for i, _ in enumerate(app.start_download()):
+            if i % 50 == 0 and progress_queue: 
+                progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
+        
+        failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
+        if failed:
+            if progress_queue: progress_queue.put(f"⚠️ Fixing {len(failed)} chapters...")
+            app.crawler.download_chapters(failed)
+            failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
+            for c in failed: c.body = f"<h1>Chapter {c.id}</h1><p><i>[Content Missing]</i></p>"
+
+        if progress_queue: progress_queue.put("📦 Binding...")
+        
+        try:
+            for fmt, f in app.bind_books(): return f
+        except IndexError:
+             raise Exception("No chapters extracted (IndexError during binding)")
+        return None
+
+    except Exception as e:
+        raise e
+    finally: 
+        app.destroy()
+        gc.collect()
+
 class NovelBot:
     def __init__(self):
-        # OPTIMIZATION: Switched to ProcessPoolExecutor.
-        # Processes release memory back to OS better than threads and bypass the GIL.
+        # PROCESS POOL: Max 2 processes to save memory while keeping 8 threads per crawler inside the process
         self.executor = ProcessPoolExecutor(max_workers=2)
         self.manager = multiprocessing.Manager()
         
@@ -76,7 +142,7 @@ class NovelBot:
         # Lists for skipping bad novels
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set() # Persistent network/parsing errors (Max Retries)
+        self.nwerror = set() # Persistent network/parsing errors
         
         # Topic IDs
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
@@ -177,7 +243,7 @@ class NovelBot:
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
-        # Remove from bad lists if successful
+        # FIX: Remove from bad lists if successful
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         if url in self.nwerror: self.nwerror.remove(url)
@@ -314,7 +380,7 @@ class NovelBot:
                 with open(queue_path, 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
-                # Filter pending against all lists including nwerror
+                # FIX: Filter pending against all lists including nwerror
                 pending = [
                     u for u in urls 
                     if u not in self.processed 
@@ -469,8 +535,10 @@ class NovelBot:
             if os.path.exists(temp_path): os.remove(temp_path)
 
     async def process_queue(self, urls, bot):
+        # Clean once before batch starts
         gc.collect()
         
+        # Filter against all lists
         to_process = []
         skipped_null = 0
         skipped_fail = 0
@@ -502,192 +570,108 @@ class NovelBot:
     async def process_novel(self, url: str, bot):
         status_msg = await self.send_log(bot, f"⏳ **Starting:** {url}")
         
-        retry_count = 0
-        MAX_RETRIES = 2
+        # NO RETRY LOOP. ONE SHOT.
         
-        while True:
-            # Use Manager Queue for multiprocessing
-            progress_queue = self.manager.Queue()
-            loop = asyncio.get_running_loop()
-            start_time = time.time()
-            
-            future = loop.run_in_executor(self.executor, self._scrape_logic, url, progress_queue)
-            
-            last_text = ""
-            last_update = 0
-            
-            # Polling queue for progress updates
-            while not future.done():
-                try:
-                    # Using get_nowait() with exception handling for non-blocking check
-                    try:
-                        text = progress_queue.get_nowait()
-                        if text != last_text and (time.time() - last_update) > 5:
-                            try: 
-                                await self.send_log(bot, text, edit_msg=status_msg)
-                                last_text = text; last_update = time.time()
-                            except: pass
-                    except queue.Empty:
-                        pass # Standard Queue Empty
-                    except Exception:
-                         pass # Manager Queue weirdness
-                    
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    await asyncio.sleep(0.5)
-
+        # Queue for communicating with the process
+        progress_queue = self.manager.Queue()
+        loop = asyncio.get_running_loop()
+        start_time = time.time()
+        
+        # Submit task to process pool
+        future = loop.run_in_executor(self.executor, scrape_logic_worker, url, progress_queue)
+        
+        # Monitor progress
+        last_text = ""
+        last_update = 0
+        
+        while not future.done():
             try:
-                epub_path = await future
-                duration = int(time.time() - start_time)
-                
-                if epub_path and os.path.exists(epub_path):
-                    file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
-                    caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
-                    
-                    try: await status_msg.delete()
-                    except: pass
-
-                    dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
-                    dest_topic_id = self.target_topic_id
-
-                    if not dest_chat_id or not dest_topic_id:
-                        await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
-                        return
-
-                    if file_size_mb > USERBOT_THRESHOLD and self.userbot:
-                        prog_msg = await self.send_log(bot, f"⚠️ File is {file_size_mb:.1f}MB (> {USERBOT_THRESHOLD}MB)\n🚀 Uploading via Userbot...")
-                        try:
-                            await self.userbot.send_document(
-                                chat_id=int(dest_chat_id),
-                                document=epub_path,
-                                caption=caption,
-                                message_thread_id=dest_topic_id
-                            )
-                            await prog_msg.delete()
-                            self.save_success(url)
-                        except Exception as e:
-                            await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
-                    else:
-                        if file_size_mb >= 50:
-                            await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
-                            self.save_error(url, "File > 50MB & No Userbot")
-                        else:
-                            with open(epub_path, 'rb') as f:
-                                await bot.send_document(
-                                    chat_id=dest_chat_id,
-                                    message_thread_id=dest_topic_id,
-                                    document=f,
-                                    caption=caption
-                                )
-                            self.save_success(url)
-
-                    os.remove(epub_path)
-                    break
-                else:
-                    self.genfail.add(url)
-                    self.save_genfail()
-                    await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
-                    break
-
-            except Exception as e:
-                err_msg = str(e)
-                
-                # --- NULLCON / INDEX ERROR HANDLER ---
-                if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
-                    self.nullcon.add(url)
-                    self.save_nullcon()
-                    try: await self.send_log(bot, f"⚠️ {url}: Nullcon/Index Error (Saved to nullcon, NO RETRY)", edit_msg=status_msg)
-                    except: pass
-                    break # BREAK LOOP IMMEDIATELY
-                
-                # --- STANDARD RETRY ---
-                else:
-                    if retry_count < MAX_RETRIES:
-                        retry_count += 1
-                        wait_time = 60
-                        logger.error(f"❌ Error (Retry {retry_count}/{MAX_RETRIES}): {url} -> {e}")
-                        try: 
-                            await self.send_log(bot, f"❌ Error: {e}\n{url}\n♻️ Retrying {retry_count}/{MAX_RETRIES} in {wait_time}s...", edit_msg=status_msg)
-                        except: pass
-                        
-                        await asyncio.sleep(wait_time)
-                        # GC in main process
-                        gc.collect()
-                        continue
-                    else:
-                        logger.error(f"❌ Max Retries Exceeded: {url} -> {e}")
-                        self.nwerror.add(url)
-                        self.save_nwerror()
-                        try: await self.send_log(bot, f"❌ Max Retries Exceeded: {url} (Added to nwerror)", edit_msg=status_msg)
-                        except: pass
-                        break
-
-    # Static method not required, but cleaner for pickling if outside class in some versions,
-    # but instance methods work with spawn/fork usually if self is picklable. 
-    # Safest to keep it here but be aware of self dependencies.
-    def _scrape_logic(self, url: str, progress_queue):
-        # Ensure sources are loaded in the worker process
-        load_sources()
-        
-        app = App()
-        try:
-            progress_queue.put(f"🔍 Fetching info...")
-            app.user_input = url
-            app.prepare_search()
-            app.get_novel_info()
-            
-            if app.crawler: 
-                # Keep user's desired thread count
-                app.crawler.init_executor(THREADS_PER_NOVEL)
-
-            if app.crawler.novel_cover:
                 try:
-                    headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
-                    response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=15)
-                    if response.status_code == 200:
-                        cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
-                        with open(cover_path, 'wb') as f: f.write(response.content)
-                        app.book_cover = cover_path
+                    text = progress_queue.get_nowait()
+                    if text != last_text and (time.time() - last_update) > 5:
+                        try: 
+                            await self.send_log(bot, text, edit_msg=status_msg)
+                            last_text = text; last_update = time.time()
+                        except: pass
+                except queue.Empty: pass
+                await asyncio.sleep(1)
+            except: await asyncio.sleep(1)
+
+        try:
+            epub_path = await future
+            duration = int(time.time() - start_time)
+            
+            if epub_path and os.path.exists(epub_path):
+                # --- SUCCESS HANDLER ---
+                file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
+                caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
+                
+                try: await status_msg.delete()
                 except: pass
 
-            app.chapters = app.crawler.chapters[:]
-            if not app.chapters:
-                # This raises Exception which is caught in process_novel
-                raise Exception("No chapters extracted")
+                dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
+                dest_topic_id = self.target_topic_id
 
-            app.pack_by_volume = False
-            app.output_formats = {'epub': True}
-            
-            total = len(app.chapters)
-            progress_queue.put(f"⬇️ Downloading {total} chapters...")
-            
-            for i, _ in enumerate(app.start_download()):
-                if i % 40 == 0: progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
-            
-            failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
-            if failed:
-                progress_queue.put(f"⚠️ Fixing {len(failed)} chapters...")
-                app.crawler.download_chapters(failed)
-                failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
-                for c in failed: c.body = f"<h1>Chapter {c.id}</h1><p><i>[Content Missing]</i></p>"
+                if not dest_chat_id or not dest_topic_id:
+                    await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
+                    return
 
-            progress_queue.put("📦 Binding...")
-            
-            try:
-                for fmt, f in app.bind_books(): return f
-            except IndexError:
-                 # Specific error for process_novel logic to catch
-                 raise Exception("No chapters extracted (IndexError during binding)")
-            return None
+                if file_size_mb > USERBOT_THRESHOLD and self.userbot:
+                    prog_msg = await self.send_log(bot, f"⚠️ File is {file_size_mb:.1f}MB (> {USERBOT_THRESHOLD}MB)\n🚀 Uploading via Userbot...")
+                    try:
+                        await self.userbot.send_document(
+                            chat_id=int(dest_chat_id),
+                            document=epub_path,
+                            caption=caption,
+                            message_thread_id=dest_topic_id
+                        )
+                        await prog_msg.delete()
+                        self.save_success(url)
+                    except Exception as e:
+                        await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
+                else:
+                    if file_size_mb >= 50:
+                        await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
+                        self.save_error(url, "File > 50MB & No Userbot")
+                    else:
+                        with open(epub_path, 'rb') as f:
+                            await bot.send_document(
+                                chat_id=dest_chat_id,
+                                message_thread_id=dest_topic_id,
+                                document=f,
+                                caption=caption
+                            )
+                        self.save_success(url)
 
-        except Exception as e: raise e
-        finally: 
-            app.destroy()
-            # Force GC in worker process
-            gc.collect()
+                os.remove(epub_path)
+                
+            else:
+                # Generation failed but no exception raised? 
+                self.genfail.add(url)
+                self.save_genfail()
+                await self.send_log(bot, f"❌ Generation failed for {url} (Added to genfail)", edit_msg=status_msg)
+
+        except Exception as e:
+            err_msg = str(e)
+            
+            # --- CRITICAL FIX: Treat IndexError as NULL CONTENT and STOP ---
+            if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
+                self.nullcon.add(url)
+                self.save_nullcon()
+                try: await self.send_log(bot, f"⚠️ {url}: Null Content/Index Error (Added to nullcon)", edit_msg=status_msg)
+                except: pass
+                # NO RETRY
+            
+            # --- ALL OTHER ERRORS: Treat as NWERROR and STOP (As per instructions) ---
+            else:
+                logger.error(f"❌ Max Retries Exceeded (Instant): {url} -> {e}")
+                self.nwerror.add(url)
+                self.save_nwerror()
+                try: await self.send_log(bot, f"❌ Error: {e} (Added to nwerror)", edit_msg=status_msg)
+                except: pass
+                # NO RETRY
 
 if __name__ == "__main__":
-    # Ensure proper multiprocessing behavior on Windows/macOS
     multiprocessing.freeze_support()
     bot = NovelBot()
     bot.start()
