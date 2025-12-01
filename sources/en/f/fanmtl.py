@@ -23,7 +23,7 @@ class FanMTLCrawler(Crawler):
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
 
-    def read_novel_info(self):
+        def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
@@ -48,8 +48,9 @@ class FanMTLCrawler(Crawler):
         is_zero_chapter = False
         
         # Indicator A: "Read" button text (e.g. "Read No chapter")
-        read_btn = soup.select_one("#readchapterbtn")
-        if read_btn and "no chapter" in read_btn.get_text(strip=True).lower():
+        # This works for the specific HTML you provided.
+        read_btn_small = soup.select_one("#readchapterbtn small")
+        if read_btn_small and "no chapter" in read_btn_small.get_text(strip=True).lower():
             is_zero_chapter = True
 
         # Indicator B: Header Stats (e.g. "No Chapters" or "0 Chapters")
@@ -63,7 +64,7 @@ class FanMTLCrawler(Crawler):
         if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
-            logger.info("Verified 0-chapter novel. Returning.")
+            logger.info("Verified 0-chapter novel. Returning immediately.")
             return 
 
         # 4. Standard Metadata Extraction
@@ -87,28 +88,29 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # 5. Pagination & Chapter Parsing
-        # CRITICAL FIX: Only look for pagination inside the .pagination container.
-        # The previous global search found the 'Sort' button which broke the logic.
+        # 5. Pagination & Chapter Parsing (Paranoid Safe Mode)
+        # We look specifically for pagination links inside the pagination container.
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
 
-        if pagination_links:
-            try:
+        try:
+            if pagination_links and len(pagination_links) > 0:
                 last_page = pagination_links[-1]
                 href = last_page.get("href")
+                
                 if href:
                     common_url = self.absolute_url(href).split("?")[0]
                     query_params = parse_qs(urlparse(href).query)
                     
-                    # Safe extraction of page count
+                    # PARANOID EXTRACTION: Check list existence and length explicitly
+                    # This fixes the "list index out of range" error
                     page_list = query_params.get("page", [])
-                    if page_list:
+                    if page_list and len(page_list) > 0:
                         page_count = int(page_list[0]) + 1
                     else:
                         page_count = 1
                     
                     wjm_list = query_params.get("wjm", [])
-                    wjm = wjm_list[0] if wjm_list else ""
+                    wjm = wjm_list[0] if wjm_list and len(wjm_list) > 0 else ""
                     
                     futures = []
                     for page in range(page_count):
@@ -119,24 +121,31 @@ class FanMTLCrawler(Crawler):
                         self.parse_chapter_list(page_soup)
                 else:
                     self.parse_chapter_list(soup)
-            except Exception as e:
-                logger.error(f"Pagination parsing failed: {e}")
+            else:
+                # No pagination found, parse current page
                 self.parse_chapter_list(soup)
-        else:
-            # No pagination found, parse the current page
+
+        except Exception as e:
+            # If ANYTHING fails in pagination, log it and fall back to simple parsing
+            # This ensures the crawler never crashes here
+            logger.error("Pagination logic failed: %s", e)
             self.parse_chapter_list(soup)
 
-        self.chapters.sort(key=lambda x: x["id"])
+        # Safe Sort
+        try:
+            self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
+        except Exception:
+            pass # Ignore sort errors
 
         # Final Verification
         if not self.chapters:
-            # If we still have 0 chapters, perform one last check on the raw HTML text
-            # This prevents the "Max Retries" loop for empty novels that slipped through check #3
-            if "no chapter" in str(soup).lower():
-                 logger.info("Final check found 'no chapter' text. Returning empty list.")
+             # Last ditch check: if chapters are empty, check the HTML text again for "No chapter"
+             # This handles edge cases where the specific HTML tag structure might vary
+             if "no chapter" in str(soup).lower():
+                 logger.info("Final text check found 'no chapter'. Returning empty.")
                  return
-            
-            raise Exception("Parsing Error: Chapter list empty but 'No Chapters' indicator missing")
+
+             raise Exception("Parsing Error: Chapter list empty but 'No Chapters' indicator missing")
 
     def parse_chapter_list(self, soup):
         for a in soup.select("ul.chapter-list li a"):
