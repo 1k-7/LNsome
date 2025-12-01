@@ -44,10 +44,11 @@ class FanMTLCrawler(Crawler):
             # If no title found, it's likely a broken page or a block.
             raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
-        # 3. PRECISE ZERO-CHAPTER CHECK
-        # User structure: <span><strong><i class="..."></i> No</strong><small>Chapters</small></span>
-        # logic: Find <small> with "Chapters" -> Check if previous sibling is <strong> with "No"
+        # 3. PRECISE ZERO-CHAPTER CHECK (Improved)
         is_zero_chapter = False
+        
+        # Method A: Specific Tag Structure
+        # Structure: <span><strong><i class="..."></i> No</strong><small>Chapters</small></span>
         for small in soup.select("small"):
             if "Chapters" in small.get_text(strip=True):
                 # find_previous_sibling("strong") skips whitespace/newlines to find the tag
@@ -56,10 +57,21 @@ class FanMTLCrawler(Crawler):
                     is_zero_chapter = True
                     break
         
+        # Method B: Robust Text Fallback (New)
+        # If the tag structure failed (e.g., extra whitespace, different nesting), check the text context.
+        if not is_zero_chapter:
+            # Find the header stats container (usually .novel-info or .header-stats)
+            header_stats = soup.select_one(".novel-info") or soup.select_one(".header-stats")
+            if header_stats:
+                # Combine text with spaces to handle "No" and "Chapters" being in different tags
+                stats_text = header_stats.get_text(" ", strip=True).lower()
+                if "no chapters" in stats_text or "0 chapters" in stats_text:
+                    is_zero_chapter = True
+        
         if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
-            logger.info("Verified 0-chapter novel (No Chapters tag found).")
+            logger.info("Verified 0-chapter novel.")
             # CRITICAL: Return immediately. This results in empty chapters list 
             # without running pagination logic that might crash.
             return 
@@ -85,28 +97,39 @@ class FanMTLCrawler(Crawler):
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
         
-        # 5. Pagination & Chapter Parsing
-        # NO try/except here. If this crashes (IndexError), it means the layout is broken/unexpected
-        # AND it is NOT a verified 0-chapter novel. The crash will bubble up to bot.py
-        # which will retry 2 times and then save to nwerror.
+        # 5. Pagination & Chapter Parsing (Safe Mode)
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
-        if not pagination:
+        
+        # We wrap this in try-except to catch the 'IndexError' if the site returns weird pagination data
+        try:
+            if pagination:
+                last_page = pagination[-1]
+                common_url = self.absolute_url(last_page["href"]).split("?")[0]
+                params = parse_qs(urlparse(last_page["href"]).query)
+                
+                # SAFE EXTRACTION: Check if 'page' exists and has items before accessing [0]
+                page_values = params.get("page", [])
+                if page_values:
+                    page_count = int(page_values[0]) + 1
+                else:
+                    page_count = 1 # Fallback if param is missing
+                
+                # Safe extraction for 'wjm'
+                wjm_values = params.get("wjm", [""])
+                wjm = wjm_values[0] if wjm_values else ""
+                
+                futures = []
+                for page in range(page_count):
+                    url = f"{common_url}?page={page}&wjm={wjm}"
+                    futures.append(self.executor.submit(self.get_soup, url))
+                
+                for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
+                    self.parse_chapter_list(page_soup)
+            else:
+                self.parse_chapter_list(soup)
+        except Exception as e:
+            logger.error(f"Pagination parsing failed: {e}. Falling back to single page list.")
             self.parse_chapter_list(soup)
-        else:
-            last_page = pagination[-1]
-            common_url = self.absolute_url(last_page["href"]).split("?")[0]
-            params = parse_qs(urlparse(last_page["href"]).query)
-            
-            page_count = int(params.get("page", [0])[0]) + 1
-            wjm = params.get("wjm", [""])[0]
-            
-            futures = []
-            for page in range(page_count):
-                url = f"{common_url}?page={page}&wjm={wjm}"
-                futures.append(self.executor.submit(self.get_soup, url))
-            
-            for page_soup in self.resolve_futures(futures, desc="TOC", unit="page"):
-                self.parse_chapter_list(page_soup)
 
         self.chapters.sort(key=lambda x: x["id"])
 
