@@ -11,7 +11,7 @@ from slugify import slugify
 
 from .. import constants as C
 from ..binders import generate_books
-from ..core.exeptions import LNException
+from ..core.exceptions import LNException
 from ..core.sources import crawler_list, prepare_crawler
 from ..models import Chapter, CombinedSearchResult, OutputFormat
 from .browser import Browser
