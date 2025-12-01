@@ -42,24 +42,24 @@ class FanMTLCrawler(Crawler):
         else:
             raise Exception("Failed to parse novel title - Possible Block or Layout Change")
 
-        # 3. PRECISE ZERO-CHAPTER CHECK
-        # User structure: <span><strong><i class="..."></i> No</strong><small>Chapters</small></span>
-        # We scan for a <strong> tag containing "No" that is immediately followed by a <small> tag containing "Chapters".
-        no_chapters_found = False
-        for strong in soup.select("strong"):
-            # Check if <strong> contains "No" (ignoring icons inside)
-            if "no" in strong.get_text(strip=True).lower():
-                # Check if immediate sibling is <small>Chapters</small>
-                sibling = strong.find_next_sibling("small")
-                if sibling and "chapters" in sibling.get_text(strip=True).lower():
-                    no_chapters_found = True
+        # 3. PRECISE ZERO-CHAPTER CHECK (Based on User HTML)
+        # Structure: <strong><i class="..."></i> No</strong> <small>Chapters</small>
+        # We look for <small> tags containing "Chapters" and check their predecessor.
+        is_zero_chapter = False
+        
+        for small_tag in soup.select("small"):
+            if "Chapters" in small_tag.get_text(strip=True):
+                # Check previous sibling element (ignoring whitespace/text nodes)
+                prev = small_tag.find_previous_sibling()
+                if prev and prev.name == "strong" and "No" in prev.get_text(strip=True):
+                    is_zero_chapter = True
                     break
         
-        if no_chapters_found:
+        if is_zero_chapter:
             self.volumes = [{"id": 1, "title": "Volume 1"}]
             self.chapters = []
             logger.info("Novel has 'No Chapters' indicator. Returning empty list.")
-            return # EXIT HERE to avoid pagination crash
+            return # <--- CRITICAL: Exit immediately to prevent pagination crash.
 
         # 4. Standard Metadata
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
@@ -83,12 +83,12 @@ class FanMTLCrawler(Crawler):
         self.chapters = []
         
         # 5. Pagination & Chapter Parsing
-        # Only runs if "No Chapters" tag was NOT found.
+        # Only runs if 'No Chapters' indicator was NOT found.
         pagination = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if not pagination:
             self.parse_chapter_list(soup)
         else:
-            # If this crashes now, it's a legitimate error/layout change, not a known 0-chapter case.
+            # If this crashes now, it is a legitimate scraping error (retryable), NOT a zero-chapter case.
             last_page = pagination[-1]
             common_url = self.absolute_url(last_page["href"]).split("?")[0]
             params = parse_qs(urlparse(last_page["href"]).query)
@@ -106,7 +106,7 @@ class FanMTLCrawler(Crawler):
 
         self.chapters.sort(key=lambda x: x["id"])
 
-        # Final Verification: If we have 0 chapters here but didn't find the "No Chapters" tag, raise error.
+        # Final Verification: If we have 0 chapters but didn't find the 'No Chapters' tag, it's a parsing error.
         if not self.chapters:
              raise Exception("Parsing Error: Chapter list empty but 'No Chapters' indicator missing")
 
